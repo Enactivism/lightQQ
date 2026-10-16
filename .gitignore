@@ -23,6 +23,9 @@ config.*.json
 *.auth
 *.credential
 *.credentials
+.npmrc
+.yarnrc
+.yarnrc.yml
 secrets/
 credentials/
 private/
@@ -61,6 +64,9 @@ qqlight-clipboard-*
 *.temp
 *.bak
 *.backup
+*.pid
+*.pid.lock
+*.sock
 
 # Private key and certificate material
 *.pem

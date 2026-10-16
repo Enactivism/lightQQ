@@ -9,6 +9,8 @@ const { spawn } = require("node:child_process");
 const WebSocket = require("ws");
 
 const IMAGE_PLACEHOLDER = "[图片]";
+const HISTORY_LOAD_LIMIT = 20;
+const HISTORY_DIR = path.resolve(__dirname, "..", ".qqlight", "history");
 
 const DEFAULT_CONFIG = {
   napcatWsUrl: "ws://127.0.0.1:3001",
@@ -430,6 +432,8 @@ class QQlightApp {
     this.pendingImages = [];
     this.keypressHandler = null;
     this.sigintHandler = null;
+    this.historyDir = HISTORY_DIR;
+    this.historyWriteQueue = Promise.resolve();
     this.rl = null;
     this.connection = new NapCatConnection(this.config, {
       onStatus: (status, detail) => {
@@ -447,6 +451,7 @@ class QQlightApp {
       output: process.stdout,
       terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY),
       prompt: this.getPrompt(),
+      completer: (line) => this.completeInput(line),
     });
     readline.emitKeypressEvents(process.stdin, this.rl);
     this.keypressHandler = (_sequence, key) => {
@@ -500,6 +505,9 @@ class QQlightApp {
 
   receiveMessage(message) {
     this.addToHistory(message);
+    this.persistMessage(message).catch((error) => {
+      this.writeLine(color("red", `[错误] 聊天记录保存失败：${error.message}`));
+    });
     if (this.activeChat?.chatType === "private"
       && message.chatType === "private"
       && message.targetId === this.activeChat.targetId
@@ -522,6 +530,25 @@ class QQlightApp {
     if (!this.rl) return;
     this.rl.setPrompt(this.getPrompt());
     if (!this.runningCommand && !this.exiting) this.rl.prompt(true);
+  }
+
+  completeInput(line) {
+    const match = String(line || "").match(/^(\/)?(sp|sg)(?:\s+(\d*))?$/i);
+    if (!match) return [[], line];
+
+    const slash = match[1] || "";
+    const command = match[2].toLowerCase();
+    const typedId = match[3];
+    if (typedId === undefined) {
+      return [[`${slash}${command} `], line];
+    }
+
+    const ids = command === "sp" ? this.config.privateIds : this.config.groupIds;
+    const prefix = `${slash}${command} `;
+    const matches = ids
+      .filter((id) => id.startsWith(typedId))
+      .map((id) => `${prefix}${id}`);
+    return [matches, line];
   }
 
   clearCurrentInput() {
@@ -611,8 +638,94 @@ class QQlightApp {
     while (this.history.length > this.config.maxHistory) this.history.shift();
   }
 
+  getHistoryFilePath(chatType, targetId) {
+    if (!['private', 'group'].includes(chatType) || !/^\d+$/.test(String(targetId))) {
+      throw new Error("无法确定聊天记录文件");
+    }
+    return path.join(this.historyDir, `${chatType}-${targetId}.jsonl`);
+  }
+
+  serializeHistoryMessage(message) {
+    return {
+      id: String(message.id),
+      time: message.time,
+      direction: message.direction,
+      chatType: message.chatType,
+      targetId: String(message.targetId),
+      senderId: String(message.senderId || ""),
+      senderName: String(message.senderName || ""),
+      text: String(message.text || ""),
+    };
+  }
+
+  persistMessage(message) {
+    const filePath = this.getHistoryFilePath(message.chatType, message.targetId);
+    const record = `${JSON.stringify(this.serializeHistoryMessage(message))}\n`;
+    const task = this.historyWriteQueue
+      .catch(() => {})
+      .then(async () => {
+        await fs.promises.mkdir(this.historyDir, { recursive: true, mode: 0o700 });
+        await fs.promises.appendFile(filePath, record, { encoding: "utf8", mode: 0o600 });
+        await fs.promises.chmod(filePath, 0o600);
+      });
+    this.historyWriteQueue = task;
+    return task;
+  }
+
+  async readChatHistory(chat, limit = HISTORY_LOAD_LIMIT) {
+    const filePath = this.getHistoryFilePath(chat.chatType, chat.targetId);
+    const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+    const input = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    const lines = [];
+
+    try {
+      for await (const line of input) {
+        if (!line.trim()) continue;
+        lines.push(line);
+        if (lines.length > limit) lines.shift();
+      }
+    } catch (error) {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    }
+
+    return lines.map((line) => {
+      try {
+        const record = JSON.parse(line);
+        if (!record || !["incoming", "outgoing"].includes(record.direction)) return null;
+        if (record.chatType !== chat.chatType || String(record.targetId) !== chat.targetId) return null;
+        if (!record.id || typeof record.text !== "string") return null;
+        return {
+          id: String(record.id),
+          time: record.time || Date.now(),
+          direction: record.direction,
+          chatType: record.chatType,
+          targetId: chat.targetId,
+          senderId: String(record.senderId || ""),
+          senderName: String(record.senderName || ""),
+          text: record.text,
+          rawMessage: record.text,
+          historySource: "persisted",
+        };
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+  }
+
+  async loadChatHistory(chat, revision) {
+    await this.historyWriteQueue.catch(() => {});
+    const messages = await this.readChatHistory(chat);
+    if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return;
+    messages.forEach((message) => this.addToHistory(message));
+    if (!messages.length) return;
+    this.writeLine(color("dim", `已加载最近 ${messages.length} 条本地聊天记录。`));
+    messages.forEach((message) => this.writeLine(this.renderMessage(message)));
+  }
+
   getVisibleHistory() {
-    return this.history.filter((message) => messageMatchesChat(message, this.activeChat));
+    return this.history.filter((message) => messageMatchesChat(message, this.activeChat)
+      && (this.activeChat || message.historySource !== "persisted"));
   }
 
   renderMessage(message) {
@@ -670,6 +783,7 @@ class QQlightApp {
       "  fg clear                     清空群聊白名单（filter group clear）",
       "  sp <QQ号>                    进入私聊并隔离其他消息（select private）",
       "  sg <群号>                    进入群聊并隔离其他消息（select group）",
+      "  Tab（sp/sg）                 补全白名单账号，连续两次显示候选",
       "  sc                           取消隔离，显示白名单消息（select clear）",
       "  （进入会话后直接输入文字即可发送）",
       "  p <QQ号> <消息>              发送私聊消息",
@@ -765,6 +879,11 @@ class QQlightApp {
     this.activeChat = chat;
     this.updatePrompt();
     this.writeLine(color("green", `已进入${chat.chatType === "group" ? "群聊" : "私聊"} ${chat.targetId}。`));
+    try {
+      await this.loadChatHistory(chat, revision);
+    } catch (error) {
+      this.writeLine(color("red", `[错误] 本地聊天记录加载失败：${error.message}`));
+    }
     if (chat.chatType === "private") this.loadPrivateNickname(chat, revision);
   }
 
@@ -824,6 +943,7 @@ class QQlightApp {
       rawMessage: typeof content === "string" ? content : safeJson(content),
     };
     this.addToHistory(message);
+    await this.persistMessage(message);
     if (messageMatchesChat(message, this.activeChat)) {
       this.writeLine(color("green", "发送成功") + ` ${this.renderMessage(message)}`);
     } else {

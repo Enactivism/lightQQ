@@ -6,11 +6,13 @@ const path = require("node:path");
 const readline = require("node:readline");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
+const { fileURLToPath } = require("node:url");
 const WebSocket = require("ws");
 
 const IMAGE_PLACEHOLDER = "[图片]";
 const HISTORY_LOAD_LIMIT = 20;
 const HISTORY_DIR = path.resolve(__dirname, "..", ".qqlight", "history");
+const IMAGE_DIR = path.resolve(__dirname, "..", ".qqlight", "images");
 
 const DEFAULT_CONFIG = {
   napcatWsUrl: "ws://127.0.0.1:3001",
@@ -202,6 +204,43 @@ function extractMessageText(message) {
   }).join("").trim();
 }
 
+function extractImageSources(message) {
+  if (Array.isArray(message)) {
+    return message
+      .filter((segment) => segment && segment.type === "image")
+      .map((segment) => {
+        const data = segment.data && typeof segment.data === "object" ? segment.data : {};
+        return {
+          file: String(data.file || ""),
+          url: String(data.url || ""),
+          type: String(data.type || ""),
+        };
+      })
+      .filter((source) => source.file || source.url);
+  }
+
+  if (typeof message !== "string") return [];
+  const sources = [];
+  const pattern = /\[CQ:image,([^\]]*)\]/g;
+  let match;
+  while ((match = pattern.exec(message))) {
+    const source = {};
+    match[1].split(",").forEach((part) => {
+      const separator = part.indexOf("=");
+      if (separator < 0) return;
+      const key = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      if (["file", "url", "type"].includes(key)) source[key] = value;
+    });
+    if (source.file || source.url) sources.push({
+      file: String(source.file || ""),
+      url: String(source.url || ""),
+      type: String(source.type || ""),
+    });
+  }
+  return sources;
+}
+
 function formatTime(value) {
   const date = new Date(value || Date.now());
   return date.toLocaleTimeString("zh-CN", { hour12: false });
@@ -217,7 +256,8 @@ function createMessageEvent(payload) {
 
   const sender = payload.sender && typeof payload.sender === "object" ? payload.sender : {};
   const senderId = String(sender.user_id || payload.user_id || "");
-  const text = extractMessageText(payload.message || payload.raw_message || "");
+  const messageContent = payload.message ?? payload.raw_message ?? "";
+  const text = extractMessageText(messageContent);
   if (!text) return null;
 
   return {
@@ -230,6 +270,7 @@ function createMessageEvent(payload) {
     senderName: String(sender.card || sender.nickname || ""),
     text,
     rawMessage: typeof payload.raw_message === "string" ? payload.raw_message : safeJson(payload.message),
+    imageSources: extractImageSources(messageContent),
   };
 }
 
@@ -422,7 +463,7 @@ class NapCatConnection {
 class QQlightApp {
   constructor() {
     this.config = loadConfig();
-    this.history = [];
+    this.historyByChat = new Map();
     this.activeChat = null;
     this.chatRevision = 0;
     this.exiting = false;
@@ -432,14 +473,23 @@ class QQlightApp {
     this.pendingImages = [];
     this.keypressHandler = null;
     this.sigintHandler = null;
+    this.projectDir = path.resolve(__dirname, "..");
     this.historyDir = HISTORY_DIR;
-    this.historyWriteQueue = Promise.resolve();
+    this.imageDir = IMAGE_DIR;
+    this.lastImagePath = null;
+    this.historyWriteQueues = new Map();
+    this.persistedMessageKeys = new Map();
+    this.messageQueue = Promise.resolve();
     this.rl = null;
     this.connection = new NapCatConnection(this.config, {
       onStatus: (status, detail) => {
         if (detail) this.writeLine(color(status.state === "open" ? "green" : "yellow", `[状态] ${detail}`));
       },
-      onMessage: (message) => this.receiveMessage(message),
+      onMessage: (message) => {
+        this.messageQueue = this.messageQueue
+          .then(() => this.receiveMessage(message))
+          .catch((error) => this.writeLine(color("red", `[错误] 消息处理失败：${error.message}`)));
+      },
       onLog: (message) => this.writeLine(color("dim", `[NapCat] ${message}`)),
     });
   }
@@ -503,19 +553,129 @@ class QQlightApp {
     if (!this.runningCommand && !this.exiting) this.rl.prompt(true);
   }
 
-  receiveMessage(message) {
-    this.addToHistory(message);
-    this.persistMessage(message).catch((error) => {
+  async receiveMessage(message) {
+    if (this.getHistoryMessage(message) || this.isRecentOutgoingImageDuplicate(message)) return;
+    const storedMessage = await this.saveMessageImages(message);
+    if (!this.addToHistory(storedMessage)) return;
+    this.persistMessage(storedMessage).catch((error) => {
       this.writeLine(color("red", `[错误] 聊天记录保存失败：${error.message}`));
     });
     if (this.activeChat?.chatType === "private"
-      && message.chatType === "private"
-      && message.targetId === this.activeChat.targetId
-      && message.senderName) {
-      this.activeChat.displayName = message.senderName;
+      && storedMessage.chatType === "private"
+      && storedMessage.targetId === this.activeChat.targetId
+      && storedMessage.senderName) {
+      this.activeChat.displayName = storedMessage.senderName;
       this.updatePrompt();
     }
-    if (messageMatchesChat(message, this.activeChat)) this.writeLine(this.renderMessage(message));
+    if (messageMatchesChat(storedMessage, this.activeChat)) {
+      this.writeLine(this.renderMessage(storedMessage));
+    }
+  }
+
+  getImageExtension(value, mime = "") {
+    const mimeExtensions = {
+      "image/avif": ".avif",
+      "image/bmp": ".bmp",
+      "image/gif": ".gif",
+      "image/jpeg": ".jpg",
+      "image/png": ".png",
+      "image/webp": ".webp",
+    };
+    const mimeType = String(mime).split(";", 1)[0].trim().toLowerCase();
+    if (mimeExtensions[mimeType]) return mimeExtensions[mimeType];
+
+    let pathname = String(value || "");
+    try {
+      if (/^[a-z][a-z\d+.-]*:/i.test(pathname)) pathname = new URL(pathname).pathname;
+    } catch {
+      // 路径格式异常时继续使用原始字符串推断扩展名。
+    }
+    const extension = path.extname(pathname).toLowerCase();
+    if ([".avif", ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".webp"].includes(extension)) {
+      return extension === ".jpeg" ? ".jpg" : extension;
+    }
+    return ".png";
+  }
+
+  async readImageValue(value, mime = "") {
+    const source = String(value || "");
+    if (!source) throw new Error("图片来源为空");
+
+    if (source.startsWith("base64://")) {
+      const buffer = Buffer.from(source.slice("base64://".length), "base64");
+      if (!buffer.length) throw new Error("Base64 图片内容为空");
+      return { buffer, extension: this.getImageExtension(source, mime) };
+    }
+
+    if (source.startsWith("data:")) {
+      const match = source.match(/^data:([^;,]+)(;base64)?,([\s\S]*)$/i);
+      if (!match) throw new Error("无法解析图片数据 URI");
+      const buffer = match[2]
+        ? Buffer.from(match[3], "base64")
+        : Buffer.from(decodeURIComponent(match[3]), "utf8");
+      if (!buffer.length) throw new Error("图片数据为空");
+      return { buffer, extension: this.getImageExtension(source, match[1]) };
+    }
+
+    if (/^https?:\/\//i.test(source)) {
+      const response = await fetch(source);
+      if (!response.ok) throw new Error(`下载图片失败：HTTP ${response.status}`);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (!buffer.length) throw new Error("下载的图片为空");
+      return {
+        buffer,
+        extension: this.getImageExtension(source, response.headers.get("content-type") || mime),
+      };
+    }
+
+    const imagePath = /^file:\/\//i.test(source) ? fileURLToPath(source) : source;
+    const buffer = await fs.promises.readFile(imagePath);
+    if (!buffer.length) throw new Error("本地图片为空");
+    return { buffer, extension: this.getImageExtension(imagePath, mime) };
+  }
+
+  async readImageSource(source) {
+    let lastError;
+    for (const value of [source.file, source.url]) {
+      if (!value) continue;
+      try {
+        return await this.readImageValue(value, source.type);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error("图片没有可用来源");
+  }
+
+  async saveMessageImages(message) {
+    if (!message.imageSources?.length) return message;
+
+    const directionLabel = message.direction === "outgoing" ? "发送" : "接收";
+    const directionPrefix = message.direction === "outgoing" ? "outgoing" : "incoming";
+
+    try {
+      await fs.promises.mkdir(this.imageDir, { recursive: true, mode: 0o700 });
+    } catch (error) {
+      this.writeLine(color("red", `[错误] 图片目录创建失败：${error.message}`));
+      return { ...message, imagePaths: [] };
+    }
+    const imagePaths = [];
+    for (const source of message.imageSources) {
+      try {
+        const { buffer, extension } = await this.readImageSource(source);
+        const imagePath = path.join(
+          this.imageDir,
+          `${directionPrefix}-${Date.now()}-${crypto.randomUUID()}${extension}`,
+        );
+        await fs.promises.writeFile(imagePath, buffer, { mode: 0o600 });
+        await fs.promises.chmod(imagePath, 0o600);
+        imagePaths.push(imagePath);
+        this.lastImagePath = imagePath;
+      } catch (error) {
+        this.writeLine(color("red", `[错误] ${directionLabel}图片保存失败：${error.message}`));
+      }
+    }
+    return { ...message, imagePaths };
   }
 
   getPrompt() {
@@ -628,14 +788,44 @@ class QQlightApp {
   }
 
   addToHistory(message) {
-    const key = messageKey(message);
-    const existingIndex = this.history.findIndex((item) => messageKey(item) === key);
-    if (existingIndex >= 0) {
-      this.history[existingIndex] = message;
-      return;
+    const chatKey = this.getChatHistoryKey(message.chatType, message.targetId);
+    let history = this.historyByChat.get(chatKey);
+    if (!history) {
+      history = [];
+      this.historyByChat.set(chatKey, history);
     }
-    this.history.push(message);
-    while (this.history.length > this.config.maxHistory) this.history.shift();
+    const key = messageKey(message);
+    const existingIndex = history.findIndex((item) => messageKey(item) === key);
+    if (existingIndex >= 0) {
+      return false;
+    }
+    history.push(message);
+    while (history.length > this.config.maxHistory) history.shift();
+    return true;
+  }
+
+  getChatHistoryKey(chatType, targetId) {
+    return `${chatType}:${String(targetId)}`;
+  }
+
+  getChatHistory(chat) {
+    if (!chat) return [];
+    return this.historyByChat.get(this.getChatHistoryKey(chat.chatType, chat.targetId)) || [];
+  }
+
+  getHistoryMessage(message) {
+    return this.getChatHistory(message).find((item) => messageKey(item) === messageKey(message)) || null;
+  }
+
+  isRecentOutgoingImageDuplicate(message) {
+    if (message.direction !== "outgoing" || !message.imageSources?.length) return false;
+    const timestamp = Number(message.time) || Date.now();
+    return this.getChatHistory(message).some((item) => item.direction === "outgoing"
+      && String(item.id).startsWith("local-")
+      && item.text === message.text
+      && Array.isArray(item.imagePaths)
+      && item.imagePaths.length > 0
+      && Math.abs((Number(item.time) || 0) - timestamp) <= 30000);
   }
 
   getHistoryFilePath(chatType, targetId) {
@@ -646,6 +836,11 @@ class QQlightApp {
   }
 
   serializeHistoryMessage(message) {
+    const imageRoot = path.resolve(this.imageDir);
+    const imagePaths = (Array.isArray(message.imagePaths) ? message.imagePaths : [])
+      .map((imagePath) => path.resolve(String(imagePath)))
+      .filter((imagePath) => imagePath.startsWith(`${imageRoot}${path.sep}`))
+      .map((imagePath) => path.relative(this.projectDir, imagePath));
     return {
       id: String(message.id),
       time: message.time,
@@ -655,20 +850,53 @@ class QQlightApp {
       senderId: String(message.senderId || ""),
       senderName: String(message.senderName || ""),
       text: String(message.text || ""),
+      imagePaths,
     };
+  }
+
+  resolveStoredImagePath(imagePath) {
+    if (typeof imagePath !== "string" || !imagePath) return null;
+    const imageRoot = path.resolve(this.imageDir);
+    const resolved = path.resolve(this.projectDir, imagePath);
+    if (!resolved.startsWith(`${imageRoot}${path.sep}`)) return null;
+    return resolved;
   }
 
   persistMessage(message) {
     const filePath = this.getHistoryFilePath(message.chatType, message.targetId);
     const record = `${JSON.stringify(this.serializeHistoryMessage(message))}\n`;
-    const task = this.historyWriteQueue
+    const chatKey = this.getChatHistoryKey(message.chatType, message.targetId);
+    const previousTask = this.historyWriteQueues.get(chatKey) || Promise.resolve();
+    const task = previousTask
       .catch(() => {})
       .then(async () => {
+        let persistedKeys = this.persistedMessageKeys.get(chatKey);
+        if (!persistedKeys) {
+          persistedKeys = new Set();
+          try {
+            const existing = await fs.promises.readFile(filePath, "utf8");
+            existing.split(/\r?\n/).forEach((line) => {
+              if (!line.trim()) return;
+              try {
+                const stored = JSON.parse(line);
+                if (stored && stored.id) persistedKeys.add(messageKey(stored));
+              } catch {
+                // 忽略损坏的旧记录，保留后续可用记录。
+              }
+            });
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+          this.persistedMessageKeys.set(chatKey, persistedKeys);
+        }
+        const key = messageKey(message);
+        if (persistedKeys.has(key)) return;
         await fs.promises.mkdir(this.historyDir, { recursive: true, mode: 0o700 });
         await fs.promises.appendFile(filePath, record, { encoding: "utf8", mode: 0o600 });
         await fs.promises.chmod(filePath, 0o600);
+        persistedKeys.add(key);
       });
-    this.historyWriteQueue = task;
+    this.historyWriteQueues.set(chatKey, task);
     return task;
   }
 
@@ -676,45 +904,59 @@ class QQlightApp {
     const filePath = this.getHistoryFilePath(chat.chatType, chat.targetId);
     const stream = fs.createReadStream(filePath, { encoding: "utf8" });
     const input = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    const lines = [];
+    const recordsByKey = new Map();
+    const recordOrder = [];
 
     try {
       for await (const line of input) {
         if (!line.trim()) continue;
-        lines.push(line);
-        if (lines.length > limit) lines.shift();
+        try {
+          const record = JSON.parse(line);
+          if (!record || !["incoming", "outgoing"].includes(record.direction)) continue;
+          if (record.chatType !== chat.chatType || String(record.targetId) !== chat.targetId) continue;
+          if (!record.id || typeof record.text !== "string") continue;
+          const stored = {
+            id: String(record.id),
+            time: record.time || Date.now(),
+            direction: record.direction,
+            chatType: record.chatType,
+            targetId: chat.targetId,
+            senderId: String(record.senderId || ""),
+            senderName: String(record.senderName || ""),
+            text: record.text,
+            rawMessage: record.text,
+            imagePaths: Array.isArray(record.imagePaths)
+              ? record.imagePaths.map((imagePath) => this.resolveStoredImagePath(imagePath)).filter(Boolean)
+              : [],
+            historySource: "persisted",
+          };
+          const key = messageKey(stored);
+          const previous = recordsByKey.get(key);
+          if (!previous) {
+            recordsByKey.set(key, stored);
+            recordOrder.push(key);
+          } else {
+            recordsByKey.set(key, {
+              ...previous,
+              ...stored,
+              imagePaths: stored.imagePaths.length ? stored.imagePaths : previous.imagePaths,
+            });
+          }
+        } catch {
+          // 忽略损坏的旧记录，继续加载其他聊天记录。
+        }
       }
     } catch (error) {
       if (error.code === "ENOENT") return [];
       throw error;
     }
 
-    return lines.map((line) => {
-      try {
-        const record = JSON.parse(line);
-        if (!record || !["incoming", "outgoing"].includes(record.direction)) return null;
-        if (record.chatType !== chat.chatType || String(record.targetId) !== chat.targetId) return null;
-        if (!record.id || typeof record.text !== "string") return null;
-        return {
-          id: String(record.id),
-          time: record.time || Date.now(),
-          direction: record.direction,
-          chatType: record.chatType,
-          targetId: chat.targetId,
-          senderId: String(record.senderId || ""),
-          senderName: String(record.senderName || ""),
-          text: record.text,
-          rawMessage: record.text,
-          historySource: "persisted",
-        };
-      } catch {
-        return null;
-      }
-    }).filter(Boolean);
+    return recordOrder.slice(-limit).map((key) => recordsByKey.get(key)).filter(Boolean);
   }
 
   async loadChatHistory(chat, revision) {
-    await this.historyWriteQueue.catch(() => {});
+    const chatKey = this.getChatHistoryKey(chat.chatType, chat.targetId);
+    await (this.historyWriteQueues.get(chatKey) || Promise.resolve()).catch(() => {});
     const messages = await this.readChatHistory(chat);
     if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return;
     messages.forEach((message) => this.addToHistory(message));
@@ -723,9 +965,107 @@ class QQlightApp {
     messages.forEach((message) => this.writeLine(this.renderMessage(message)));
   }
 
+  async findStoredImageCandidates() {
+    let entries;
+    try {
+      entries = await fs.promises.readdir(this.imageDir, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+
+    const candidates = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !/\.(avif|bmp|gif|jpe?g|png|webp)$/i.test(entry.name)) continue;
+      const imagePath = path.join(this.imageDir, entry.name);
+      try {
+        const stat = await fs.promises.stat(imagePath);
+        candidates.push({ imagePath, mtimeMs: stat.mtimeMs });
+      } catch {
+        // 文件可能在扫描期间被清理，跳过即可。
+      }
+    }
+    candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+    return candidates.map((candidate) => candidate.imagePath);
+  }
+
+  findActiveChatImageCandidates() {
+    const candidates = [];
+    this.getChatHistory(this.activeChat).forEach((message, messageIndex) => {
+      const imagePaths = Array.isArray(message.imagePaths) ? message.imagePaths : [];
+      imagePaths.forEach((imagePath, imageIndex) => {
+        const resolvedPath = this.resolveStoredImagePath(imagePath);
+        if (!resolvedPath) return;
+        candidates.push({
+          imagePath: resolvedPath,
+          time: Number(message.time) || 0,
+          messageIndex,
+          imageIndex,
+        });
+      });
+    });
+    candidates.sort((left, right) => right.time - left.time
+      || right.messageIndex - left.messageIndex
+      || right.imageIndex - left.imageIndex);
+    return candidates.map((candidate) => candidate.imagePath);
+  }
+
+  async findImageByIndex(index = 1) {
+    const candidates = this.activeChat
+      ? this.findActiveChatImageCandidates()
+      : await this.findStoredImageCandidates();
+    this.lastImagePath = candidates[index - 1] || null;
+    return this.lastImagePath;
+  }
+
+  launchImageViewer(imagePath) {
+    const commands = process.platform === "darwin"
+      ? [["open", [imagePath]]]
+      : process.platform === "win32"
+        ? [["cmd.exe", ["/c", "start", "", imagePath]]]
+        : [["xdg-open", [imagePath]], ["gio", ["open", imagePath]]];
+
+    return new Promise((resolve, reject) => {
+      let index = 0;
+      let lastError;
+      const tryNext = () => {
+        if (index >= commands.length) {
+          reject(lastError || new Error("未找到可用的本机图像查看器"));
+          return;
+        }
+        const [command, args] = commands[index++];
+        const child = spawn(command, args, { detached: true, stdio: "ignore" });
+        child.once("error", (error) => {
+          lastError = error;
+          tryNext();
+        });
+        child.once("spawn", () => {
+          child.unref();
+          resolve();
+        });
+      };
+      tryNext();
+    });
+  }
+
+  async openLatestImage(index = 1) {
+    const imagePath = await this.findImageByIndex(index);
+    if (!imagePath) {
+      const scope = this.activeChat ? "当前隔离聊天中" : "当前图片记录中";
+      this.writeLine(color("yellow", `${scope}没有第 ${index} 张图片。`));
+      return;
+    }
+    try {
+      await this.launchImageViewer(imagePath);
+      this.writeLine(color("green", `已打开第 ${index} 张图片（按最近顺序）：${imagePath}`));
+    } catch (error) {
+      this.writeLine(color("red", `[错误] 图片查看器打开失败：${error.message}`));
+    }
+  }
+
   getVisibleHistory() {
-    return this.history.filter((message) => messageMatchesChat(message, this.activeChat)
-      && (this.activeChat || message.historySource !== "persisted"));
+    if (!this.activeChat) return [];
+    return [...this.getChatHistory(this.activeChat)];
   }
 
   renderMessage(message) {
@@ -750,6 +1090,15 @@ class QQlightApp {
       if (lower === "help" || lower === "h" || lower === "?") return this.showHelp();
       if (lower === "status" || lower === "s") return this.showStatus();
       if (lower === "ls") return this.showWhitelist();
+      if (/^op(?:\s|$)/.test(lower)) {
+        const match = command.match(/^op\s+img(?:\s+(\d+))?$/i);
+        if (!match) throw new Error("用法：op img [index]");
+        const index = match[1] ? Number(match[1]) : 1;
+        if (!Number.isSafeInteger(index) || index < 1) {
+          throw new Error("图片索引必须是大于等于 1 的整数");
+        }
+        return await this.openLatestImage(index);
+      }
       if (lower === "reconnect" || lower === "r") {
         this.connection.reconnect();
         return;
@@ -758,9 +1107,6 @@ class QQlightApp {
       if (/^(sp|sg|sc)(?:\s|$)/.test(lower)) return await this.selectChat(command);
       if (lower === "history" || lower.startsWith("history ")) return this.showHistory(command);
       if (/^(fp|fg)(?:\s|$)/.test(lower)) return this.setFilter(command);
-      if (lower.startsWith("send ") || /^(p|private|g|group)\s+\d+\s+/.test(command)) {
-        return await this.sendFromCommand(command);
-      }
       if (this.activeChat && !line.startsWith("/")) {
         return await this.sendToActiveChat(line, pendingImages);
       }
@@ -786,11 +1132,8 @@ class QQlightApp {
       "  Tab（sp/sg）                 补全白名单账号，连续两次显示候选",
       "  sc                           取消隔离，显示白名单消息（select clear）",
       "  （进入会话后直接输入文字即可发送）",
-      "  p <QQ号> <消息>              发送私聊消息",
-      "  g <群号> <消息>              发送群聊消息",
-      "  send private <QQ号> <消息>   发送私聊消息",
-      "  send group <群号> <消息>      发送群聊消息",
-      "  history [数量]                查看本次运行收到/发送的消息",
+      "  history [数量]                查看当前隔离聊天的历史消息",
+      "  op img [index]               打开图片；1 为最近一张，省略 index 默认使用 1",
       "  status                       查看连接状态",
       "  help                         查看帮助",
       "  Ctrl+C                       清除当前输入",
@@ -800,7 +1143,7 @@ class QQlightApp {
       "  reconnect                    立即重连 NapCat",
       "  quit                         退出 QQlight",
       "",
-      "示例：send group 123456789 大家好",
+      "示例：sp <QQ号>，然后直接输入消息",
     ].forEach((line) => this.writeLine(line));
   }
 
@@ -840,6 +1183,10 @@ class QQlightApp {
   }
 
   showHistory(command) {
+    if (!this.activeChat) {
+      this.writeLine(color("yellow", "请先使用 sp 或 sg 进入隔离聊天，再查看对应聊天历史。"));
+      return;
+    }
     const countText = command.slice("history".length).trim();
     const visibleHistory = this.getVisibleHistory();
     const count = countText ? Math.max(1, Math.min(visibleHistory.length, Number(countText) || 20)) : 20;
@@ -903,16 +1250,6 @@ class QQlightApp {
     }
   }
 
-  async sendFromCommand(command) {
-    let match = command.match(/^send\s+(private|group|p|g)\s+(\d+)\s+([\s\S]+)$/i);
-    if (!match) match = command.match(/^(private|p|group|g)\s+(\d+)\s+([\s\S]+)$/i);
-    if (!match) throw new Error("用法：send private|group <ID> <消息>");
-
-    const typeValue = match[1].toLowerCase();
-    const chatType = ["private", "p"].includes(typeValue) ? "private" : "group";
-    return this.sendMessage(chatType, match[2], match[3].trim());
-  }
-
   async sendToActiveChat(text, pendingImages = []) {
     const draft = this.buildDraftMessage(text, pendingImages);
     return this.sendMessage(
@@ -930,9 +1267,12 @@ class QQlightApp {
       ? { user_id: Number(targetId), message: content }
       : { group_id: Number(targetId), message: content };
 
-    await this.connection.send(action, params);
+    const response = await this.connection.send(action, params);
+    const responseMessageId = response && response.data && response.data.message_id;
     const message = {
-      id: `local-${Date.now()}`,
+      id: responseMessageId === undefined || responseMessageId === null
+        ? `local-${Date.now()}`
+        : String(responseMessageId),
       time: Date.now(),
       direction: "outgoing",
       chatType,
@@ -941,11 +1281,20 @@ class QQlightApp {
       senderName: "",
       text: displayText,
       rawMessage: typeof content === "string" ? content : safeJson(content),
+      imageSources: extractImageSources(content),
     };
-    this.addToHistory(message);
-    await this.persistMessage(message);
-    if (messageMatchesChat(message, this.activeChat)) {
-      this.writeLine(color("green", "发送成功") + ` ${this.renderMessage(message)}`);
+    const existingMessage = this.getHistoryMessage(message);
+    if (existingMessage) {
+      if (messageMatchesChat(existingMessage, this.activeChat)) {
+        this.writeLine(color("green", "发送成功") + ` ${this.renderMessage(existingMessage)}`);
+      }
+      return;
+    }
+    const storedMessage = await this.saveMessageImages(message);
+    if (!this.addToHistory(storedMessage)) return;
+    await this.persistMessage(storedMessage);
+    if (messageMatchesChat(storedMessage, this.activeChat)) {
+      this.writeLine(color("green", "发送成功") + ` ${this.renderMessage(storedMessage)}`);
     } else {
       this.writeLine(color("green", "发送成功（当前会话已隔离）"));
     }

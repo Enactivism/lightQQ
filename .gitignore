@@ -6,6 +6,9 @@ coverage/
 .cache/
 tmp/
 temp/
+.local/
+.direnv/
+.envrc
 
 # Local configuration and environment secrets
 .env
@@ -23,6 +26,11 @@ config.*.json
 *.auth
 *.credential
 *.credentials
+*.secret.json
+*.secrets.json
+*.dump
+*.trace
+*.out
 .npmrc
 .yarnrc
 .yarnrc.yml
@@ -75,6 +83,11 @@ qqlight-clipboard-*
 *.p12
 *.pfx
 *.jks
+*.crt
+*.csr
+*.pub
+*.gpg
+*.asc
 id_rsa*
 id_dsa*
 id_ecdsa*

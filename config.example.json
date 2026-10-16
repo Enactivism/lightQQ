@@ -1,0 +1,7 @@
+{
+  "napcatWsUrl": "ws://127.0.0.1:3001",
+  "accessToken": "",
+  "privateIds": [],
+  "groupIds": [],
+  "maxHistory": 200
+}

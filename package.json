@@ -1,0 +1,21 @@
+{
+  "name": "lightqq",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A lightweight terminal client for NapCat through OneBot 11 WebSocket",
+  "main": "src/qqlight.js",
+  "bin": {
+    "qqlight": "src/qqlight.js",
+    "QQlight": "src/qqlight.js"
+  },
+  "scripts": {
+    "start": "node src/qqlight.js",
+    "dev": "node --watch src/qqlight.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

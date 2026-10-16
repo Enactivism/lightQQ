@@ -28,6 +28,8 @@ credentials/
 private/
 
 # Local application state and private user data
+.qqlight/
+chat-history/
 data/
 runtime/
 state/

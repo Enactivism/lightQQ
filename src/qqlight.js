@@ -755,6 +755,12 @@ class QQlightApp {
       targetId: match[2],
       displayName: "",
     };
+    const whitelist = chat.chatType === "private" ? this.config.privateIds : this.config.groupIds;
+    if (!whitelist.includes(chat.targetId)) {
+      const label = chat.chatType === "private" ? "私聊" : "群聊";
+      this.writeLine(color("yellow", `${label} ${chat.targetId} 不在白名单中，无法进入。请先使用 ${chat.chatType === "private" ? "fp" : "fg"} 添加。`));
+      return;
+    }
     const revision = ++this.chatRevision;
     this.activeChat = chat;
     this.updatePrompt();

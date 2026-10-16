@@ -8,6 +8,8 @@ const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const WebSocket = require("ws");
 
+const IMAGE_PLACEHOLDER = "[图片]";
+
 const DEFAULT_CONFIG = {
   napcatWsUrl: "ws://127.0.0.1:3001",
   accessToken: "",
@@ -425,7 +427,9 @@ class QQlightApp {
     this.runningCommand = false;
     this.commandQueue = Promise.resolve();
     this.lastPasteTime = 0;
+    this.pendingImages = [];
     this.keypressHandler = null;
+    this.sigintHandler = null;
     this.rl = null;
     this.connection = new NapCatConnection(this.config, {
       onStatus: (status, detail) => {
@@ -446,20 +450,32 @@ class QQlightApp {
     });
     readline.emitKeypressEvents(process.stdin, this.rl);
     this.keypressHandler = (_sequence, key) => {
-      if (!key || !key.ctrl || key.name !== "v") return;
+      if (!key || !key.ctrl) return;
+      if (key.name === "c" && !key.shift) {
+        this.clearCurrentInput();
+        return;
+      }
+      if (key.name === "d") {
+        this.exit();
+        return;
+      }
+      if (key.name !== "v") return;
       if (key.shift) this.handleTextPaste();
       else this.handleImagePaste();
     };
     process.stdin.on("keypress", this.keypressHandler);
     this.rl.on("line", (line) => {
+      const pendingImages = this.takePendingImages(line);
       this.commandQueue = this.commandQueue
-        .then(() => this.runCommand(line))
+        .then(() => this.runCommand(line, pendingImages))
         .catch((error) => this.writeLine(color("red", `[错误] ${error.message}`)));
     });
     this.rl.on("close", () => {
       if (!this.exiting) this.exit();
     });
-    process.once("SIGINT", () => this.exit());
+    this.rl.on("SIGINT", () => this.clearCurrentInput());
+    this.sigintHandler = () => this.clearCurrentInput();
+    process.on("SIGINT", this.sigintHandler);
     this.rl.prompt();
     this.connection.start();
   }
@@ -468,6 +484,7 @@ class QQlightApp {
     console.log(color("cyan", "QQlight 0.1.0 — NapCat 终端客户端"));
     console.log(color("dim", `配置文件：${CONFIG_PATH}`));
     console.log(color("dim", "输入 help 查看命令；只有白名单中的私聊和群聊消息会被接收。"));
+    console.log(color("yellow", "提示：按 Ctrl+D 退出程序"));
   }
 
   writeLine(message) {
@@ -507,6 +524,14 @@ class QQlightApp {
     if (!this.runningCommand && !this.exiting) this.rl.prompt(true);
   }
 
+  clearCurrentInput() {
+    this.pendingImages = [];
+    if (!this.rl || this.exiting) return;
+    this.rl.write(null, { ctrl: true, name: "a" });
+    this.rl.write(null, { ctrl: true, name: "k" });
+    this.rl.prompt(true);
+  }
+
   handleImagePaste() {
     const now = Date.now();
     if (now - this.lastPasteTime < 250) return;
@@ -544,12 +569,35 @@ class QQlightApp {
       return;
     }
     const { output } = await readClipboardImage();
-    await this.sendMessage(
-      this.activeChat.chatType,
-      this.activeChat.targetId,
-      [{ type: "image", data: { file: `base64://${output.toString("base64")}` } }],
-      "[图片]",
-    );
+    this.pendingImages.push({
+      type: "image",
+      data: { file: `base64://${output.toString("base64")}` },
+    });
+    if (this.rl) this.rl.write(IMAGE_PLACEHOLDER);
+  }
+
+  takePendingImages(input) {
+    const line = String(input || "");
+    const placeholderCount = line.split(IMAGE_PLACEHOLDER).length - 1;
+    const images = placeholderCount ? this.pendingImages.slice(0, placeholderCount) : [];
+    this.pendingImages = [];
+    return images;
+  }
+
+  buildDraftMessage(text, images) {
+    const line = String(text || "").trim();
+    if (!images.length) return { content: line, displayText: line };
+
+    const pieces = line.split(IMAGE_PLACEHOLDER);
+    const content = [];
+    let imageIndex = 0;
+    pieces.forEach((piece, index) => {
+      if (piece) content.push({ type: "text", data: { text: piece } });
+      if (index >= pieces.length - 1) return;
+      const image = images[imageIndex++];
+      content.push(image || { type: "text", data: { text: IMAGE_PLACEHOLDER } });
+    });
+    return { content, displayText: line };
   }
 
   addToHistory(message) {
@@ -575,7 +623,7 @@ class QQlightApp {
     return `${color("dim", formatTime(message.time))} ${color(directionColor, `${icon} ${kind} ${message.targetId}`)}${sender}: ${message.text}`;
   }
 
-  async runCommand(input) {
+  async runCommand(input, pendingImages = []) {
     const line = String(input || "").trim();
     if (!line) {
       if (this.rl) this.rl.prompt();
@@ -601,7 +649,7 @@ class QQlightApp {
         return await this.sendFromCommand(command);
       }
       if (this.activeChat && !line.startsWith("/")) {
-        return await this.sendToActiveChat(line);
+        return await this.sendToActiveChat(line, pendingImages);
       }
       this.writeLine(color("yellow", "未知命令，输入 help 查看帮助。"));
     } catch (error) {
@@ -631,7 +679,8 @@ class QQlightApp {
       "  history [数量]                查看本次运行收到/发送的消息",
       "  status                       查看连接状态",
       "  help                         查看帮助",
-      "  Ctrl+V                       粘贴剪贴板图片并发送",
+      "  Ctrl+C                       清除当前输入",
+      "  Ctrl+V                       粘贴剪贴板图片占位符，回车发送",
       "  Ctrl+Shift+V                 粘贴剪贴板文字并发送",
       "  Ctrl+D                       退出程序",
       "  reconnect                    立即重连 NapCat",
@@ -739,8 +788,14 @@ class QQlightApp {
     return this.sendMessage(chatType, match[2], match[3].trim());
   }
 
-  async sendToActiveChat(text) {
-    return this.sendMessage(this.activeChat.chatType, this.activeChat.targetId, text.trim());
+  async sendToActiveChat(text, pendingImages = []) {
+    const draft = this.buildDraftMessage(text, pendingImages);
+    return this.sendMessage(
+      this.activeChat.chatType,
+      this.activeChat.targetId,
+      draft.content,
+      draft.displayText,
+    );
   }
 
   async sendMessage(chatType, targetId, content, displayText = content) {
@@ -774,6 +829,7 @@ class QQlightApp {
     if (this.exiting) return;
     this.exiting = true;
     if (this.keypressHandler) process.stdin.off("keypress", this.keypressHandler);
+    if (this.sigintHandler) process.off("SIGINT", this.sigintHandler);
     this.connection.stop();
     if (this.rl) this.rl.close();
     process.stdout.write("QQlight 已退出。\n");

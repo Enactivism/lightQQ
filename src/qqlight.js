@@ -293,6 +293,10 @@ function formatTime(value) {
   return date.toLocaleTimeString("zh-CN", { hour12: false });
 }
 
+function normalizeChatName(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, 80);
+}
+
 function createMessageEvent(payload) {
   if (!payload || !["message", "message_sent"].includes(payload.post_type)) return null;
   if (!["private", "group"].includes(payload.message_type)) return null;
@@ -313,6 +317,7 @@ function createMessageEvent(payload) {
     direction: payload.post_type === "message_sent" ? "outgoing" : "incoming",
     chatType,
     targetId,
+    chatName: chatType === "group" ? normalizeChatName(payload.group_name) : "",
     senderId,
     senderName: String(sender.card || sender.nickname || ""),
     text,
@@ -614,6 +619,13 @@ class QQlightApp {
       this.activeChat.displayName = storedMessage.senderName;
       this.updatePrompt();
     }
+    if (this.activeChat?.chatType === "group"
+      && storedMessage.chatType === "group"
+      && storedMessage.targetId === this.activeChat.targetId
+      && storedMessage.chatName) {
+      this.activeChat.displayName = storedMessage.chatName;
+      this.updatePrompt();
+    }
     if (messageMatchesChat(storedMessage, this.activeChat)) {
       this.writeLine(this.renderMessage(storedMessage));
     }
@@ -730,7 +742,7 @@ class QQlightApp {
     if (this.activeChat.chatType === "private") {
       return `${this.activeChat.displayName || this.activeChat.targetId} > `;
     }
-    return `群聊 ${this.activeChat.targetId} > `;
+    return `群聊 ${this.activeChat.displayName || "（正在获取群名称）"} > `;
   }
 
   updatePrompt() {
@@ -894,6 +906,7 @@ class QQlightApp {
       direction: message.direction,
       chatType: message.chatType,
       targetId: String(message.targetId),
+      chatName: message.chatType === "group" ? normalizeChatName(message.chatName) : "",
       senderId: String(message.senderId || ""),
       senderName: String(message.senderName || ""),
       text: String(message.text || ""),
@@ -968,6 +981,7 @@ class QQlightApp {
             direction: record.direction,
             chatType: record.chatType,
             targetId: chat.targetId,
+            chatName: record.chatType === "group" ? normalizeChatName(record.chatName) : "",
             senderId: String(record.senderId || ""),
             senderName: String(record.senderName || ""),
             text: record.text,
@@ -1006,6 +1020,14 @@ class QQlightApp {
     await (this.historyWriteQueues.get(chatKey) || Promise.resolve()).catch(() => {});
     const messages = await this.readChatHistory(chat);
     if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return;
+    const storedChatName = messages
+      .slice()
+      .reverse()
+      .find((message) => message.chatName)?.chatName;
+    if (storedChatName) {
+      chat.displayName = storedChatName;
+      this.updatePrompt();
+    }
     messages.forEach((message) => this.addToHistory(message));
     if (!messages.length) return;
     this.writeLine(color("dim", `已加载最近 ${messages.length} 条本地聊天记录。`));
@@ -1118,9 +1140,12 @@ class QQlightApp {
   renderMessage(message) {
     const icon = message.direction === "outgoing" ? "↑" : "↓";
     const kind = message.chatType === "private" ? "私聊" : "群聊";
+    const chatLabel = message.chatType === "private"
+      ? `${kind} ${message.targetId}`
+      : `${kind} ${message.chatName || "（未知群名称）"}`;
     const sender = message.senderName ? ` ${message.senderName}` : "";
     const directionColor = message.direction === "outgoing" ? "magenta" : "cyan";
-    return `${color("dim", formatTime(message.time))} ${color(directionColor, `${icon} ${kind} ${message.targetId}`)}${sender}: ${message.text}`;
+    return `${color("dim", formatTime(message.time))} ${color(directionColor, `${icon} ${chatLabel}`)}${sender}: ${message.text}`;
   }
 
   async runCommand(input, pendingImages = []) {
@@ -1200,7 +1225,12 @@ class QQlightApp {
     this.writeLine(`地址：${status.wsUrl}`);
     this.writeLine(`私聊白名单：${status.privateIds.length ? status.privateIds.join(", ") : "空（不接收）"}`);
     this.writeLine(`群聊白名单：${status.groupIds.length ? status.groupIds.join(", ") : "空（不接收）"}`);
-    this.writeLine(`当前会话：${this.activeChat ? `${this.activeChat.chatType === "private" ? "私聊" : "群聊"} ${this.activeChat.targetId}` : "全部白名单消息"}`);
+    const currentChat = !this.activeChat
+      ? "全部白名单消息"
+      : this.activeChat.chatType === "private"
+        ? `私聊 ${this.activeChat.displayName || this.activeChat.targetId}`
+        : `群聊 ${this.activeChat.displayName || "（正在获取群名称）"}`;
+    this.writeLine(`当前会话：${currentChat}`);
   }
 
   showWhitelist() {
@@ -1272,13 +1302,16 @@ class QQlightApp {
     const revision = ++this.chatRevision;
     this.activeChat = chat;
     this.updatePrompt();
-    this.writeLine(color("green", `已进入${chat.chatType === "group" ? "群聊" : "私聊"} ${chat.targetId}。`));
+    this.writeLine(color("green", chat.chatType === "group"
+      ? "已进入群聊，正在获取群名称。"
+      : `已进入私聊 ${chat.targetId}。`));
     try {
       await this.loadChatHistory(chat, revision);
     } catch (error) {
       this.writeLine(color("red", `[错误] 本地聊天记录加载失败：${error.message}`));
     }
     if (chat.chatType === "private") this.loadPrivateNickname(chat, revision);
+    else this.loadGroupName(chat, revision);
   }
 
   async loadPrivateNickname(chat, revision) {
@@ -1294,6 +1327,22 @@ class QQlightApp {
       this.updatePrompt();
     } catch {
       // 进入会话不依赖资料接口；资料获取失败时继续使用 QQ 号作为提示。
+    }
+  }
+
+  async loadGroupName(chat, revision) {
+    try {
+      const response = await this.connection.send("get_group_info", {
+        group_id: Number(chat.targetId),
+      });
+      if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return;
+      const data = response && response.data;
+      const groupName = normalizeChatName(data && data.group_name);
+      if (!groupName) return;
+      chat.displayName = groupName;
+      this.updatePrompt();
+    } catch {
+      // 群名称获取失败时继续使用无号码提示，不影响进入隔离聊天。
     }
   }
 
@@ -1326,6 +1375,10 @@ class QQlightApp {
       targetId,
       senderId: "",
       senderName: "",
+      chatName: chatType === "group" && this.activeChat?.chatType === "group"
+        && this.activeChat.targetId === targetId
+        ? normalizeChatName(this.activeChat.displayName)
+        : "",
       text: displayText,
       rawMessage: typeof content === "string" ? content : safeJson(content),
       imageSources: extractImageSources(content),

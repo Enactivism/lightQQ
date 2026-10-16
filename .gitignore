@@ -9,6 +9,9 @@ temp/
 .local/
 .direnv/
 .envrc
+.config/
+.venv/
+venv/
 
 # Local configuration and environment secrets
 .env
@@ -53,14 +56,24 @@ uploads/
 *.db-*
 *.sqlite
 *.sqlite3
+*.sqlite-*
+*.sqlite3-*
 *.session
 *.session.*
 *.jsonl
+*.history
+*.history.*
 
 # Logs and diagnostic dumps
 logs/
 *.log
 *.log.*
+*.dump
+*.trace
+*.out
+core
+core.*
+*.core
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -68,6 +81,8 @@ pnpm-debug.log*
 
 # Temporary clipboard and exported files
 qqlight-clipboard-*
+exports/
+export/
 *.tmp
 *.temp
 *.bak
@@ -88,6 +103,7 @@ qqlight-clipboard-*
 *.pub
 *.gpg
 *.asc
+*.pkey
 id_rsa*
 id_dsa*
 id_ecdsa*
@@ -103,3 +119,22 @@ ehthumbs.db
 .idea/
 .vscode/
 .fleet/
+
+# Local media and documents; use git add -f only for intentionally public assets
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.heic
+*.bmp
+*.tiff
+*.mp3
+*.wav
+*.ogg
+*.mp4
+*.mov
+*.mkv
+*.zip
+*.7z
+*.rar

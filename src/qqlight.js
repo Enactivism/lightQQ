@@ -97,7 +97,7 @@ function safeJson(value) {
   }
 }
 
-function readClipboardCommand(command, args) {
+function runCommand(command, args, { allowEmpty = false } = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const stdout = [];
@@ -115,7 +115,7 @@ function readClipboardCommand(command, args) {
       if (settled) return;
       settled = true;
       const output = Buffer.concat(stdout);
-      if (code === 0 && output.length) {
+      if (code === 0 && (output.length || allowEmpty)) {
         resolve(output);
         return;
       }
@@ -129,7 +129,7 @@ async function readClipboard(commands) {
   let lastError;
   for (const [command, args] of commands) {
     try {
-      return await readClipboardCommand(command, args);
+      return await runCommand(command, args);
     } catch (error) {
       lastError = error;
     }
@@ -137,13 +137,58 @@ async function readClipboard(commands) {
   throw lastError || new Error("未找到可用的剪贴板工具");
 }
 
-async function readClipboardText() {
-  const output = await readClipboard([
+function getClipboardTextCommands() {
+  const commands = [];
+  if (process.platform === "darwin") commands.push(["pbpaste", []]);
+  commands.push(
     ["wl-paste", ["--no-newline"]],
     ["xclip", ["-selection", "clipboard", "-o"]],
     ["xsel", ["--clipboard", "--output"]],
-  ]);
+  );
+  return commands;
+}
+
+async function readClipboardText() {
+  const output = await readClipboard(getClipboardTextCommands());
   return output.toString("utf8").replace(/\r\n/g, "\n").trim();
+}
+
+async function readClipboardImageMacOS() {
+  let tempDir;
+  try {
+    tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "qqlight-clipboard-"));
+    const imagePath = path.join(tempDir, "image.png");
+    await fs.promises.writeFile(imagePath, Buffer.alloc(0), { mode: 0o600 });
+
+    const script = [
+      "on run argv",
+      "  set outputPath to item 1 of argv",
+      "  set outputFile to POSIX file outputPath",
+      "  set outputRef to missing value",
+      "  try",
+      "    set imageData to the clipboard as «class PNGf»",
+      "    set outputRef to open for access outputFile with write permission",
+      "    set eof outputRef to 0",
+      "    write imageData to outputRef",
+      "    close access outputRef",
+      "  on error errorMessage number errorNumber",
+      "    if outputRef is not missing value then",
+      "      try",
+      "        close access outputRef",
+      "      end try",
+      "    end if",
+      "    error errorMessage number errorNumber",
+      "  end try",
+      "end run",
+    ].join("\n");
+
+    await runCommand("osascript", ["-e", script, imagePath], { allowEmpty: true });
+    const output = await fs.promises.readFile(imagePath);
+    if (!output.length) throw new Error("macOS 剪贴板中没有可读取的图片");
+    return { output, extension: "png" };
+  } finally {
+    if (tempDir) await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function readClipboardImage() {
@@ -152,6 +197,8 @@ async function readClipboardImage() {
     ["image/jpeg", "jpg"],
     ["image/webp", "webp"],
   ];
+  if (process.platform === "darwin") return readClipboardImageMacOS();
+
   let lastError;
   for (const [mime, extension] of imageTypes) {
     try {

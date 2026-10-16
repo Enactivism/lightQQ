@@ -1,8 +1,8 @@
-# QQlight
+# QQlight：实现在终端里面进行qq聊天
 
-QQlight 是一个运行在终端里的轻量 NapCat 客户端，通过 OneBot 11 WebSocket 收取并发送 QQ 私聊、群聊消息。
+QQlight 是一个运行在终端里的轻量 NapCat 客户端，通过 OneBot 11 WebSocket 收取并发送 QQ 私聊、群聊消息。相比原版qq更加节省内存等资源。
 
-本文中的 `NapCat` 即 NapCatQQ；如果你所说的 `NatCap` 指的是 NapCat，下面的部署方式适用。
+本文中的 `NapCat` 即 NapCatQQ。
 
 > 平台状态：Ubuntu/Linux 是当前开发和验证环境。Windows、macOS 的部署方案已补充，但目前都没有进行实际测试，不保证 NapCat、终端快捷键或剪贴板功能在这些平台上完全可用。
 

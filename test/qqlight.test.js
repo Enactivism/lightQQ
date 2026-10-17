@@ -245,3 +245,55 @@ test("CQ 字符串格式的 B站 JSON 卡片也能提取", () => {
 
   assert.equal(event.text, "[B站视频] 另一个视频 | https://b23.tv/another-video");
 });
+
+test("群聊输入 [QQ号]消息 会构造标准 at 消息段", async () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.activeChat = { chatType: "group", targetId: "987654" };
+  app.buildDraftMessage = QQlightApp.prototype.buildDraftMessage;
+  let sent;
+  app.sendMessage = async (...args) => {
+    sent = args;
+  };
+
+  await app.sendToActiveChat("[123456789]你好");
+
+  assert.deepEqual(sent, [
+    "group",
+    "987654",
+    [
+      { type: "at", data: { qq: "123456789" } },
+      { type: "text", data: { text: "你好" } },
+    ],
+    "@123456789 你好",
+  ]);
+});
+
+test("群聊可以按群名片解析昵称并@成员", async () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.activeChat = { chatType: "group", targetId: "987654" };
+  app.groupMembersById = new Map();
+  app.connection = {
+    send: async (action, params) => {
+      assert.equal(action, "get_group_member_list");
+      assert.deepEqual(params, { group_id: 987654 });
+      return { data: [{ user_id: 123456789, card: "叉叉.L", nickname: "测试昵称" }] };
+    },
+  };
+  app.buildDraftMessage = QQlightApp.prototype.buildDraftMessage;
+  let sent;
+  app.sendMessage = async (...args) => {
+    sent = args;
+  };
+
+  await app.sendToActiveChat("[叉叉.L]你好");
+
+  assert.deepEqual(sent, [
+    "group",
+    "987654",
+    [
+      { type: "at", data: { qq: "123456789" } },
+      { type: "text", data: { text: "你好" } },
+    ],
+    "@叉叉.L 你好",
+  ]);
+});

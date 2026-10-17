@@ -126,6 +126,35 @@ function normalizeIds(value) {
   return [...new Set(values.map((item) => String(item).trim()).filter((item) => /^\d+$/.test(item)))];
 }
 
+function parseGroupMention(value) {
+  const source = String(value || "").trim();
+  const bracketMatch = source.match(/^\[([^\]\r\n]+)\]([\s\S]*)$/);
+  const atMatch = source.match(/^@(\d+)(?:\s+([\s\S]*))?$/);
+  if (!bracketMatch && !atMatch) return null;
+  const target = String(bracketMatch ? bracketMatch[1] : atMatch[1]).trim();
+  if (!target) return null;
+  const text = String(bracketMatch ? bracketMatch[2] : atMatch[2] || "").trim();
+  return {
+    target,
+    userId: /^\d+$/.test(target) ? target : "",
+    text,
+    displayText: `@${target}${text ? ` ${text}` : ""}`,
+  };
+}
+
+function createAtMessageContent(userId, content) {
+  const atSegment = { type: "at", data: { qq: String(userId) } };
+  if (Array.isArray(content)) return [atSegment, ...content];
+  if (String(content || "").trim()) {
+    return [atSegment, { type: "text", data: { text: String(content) } }];
+  }
+  return [atSegment];
+}
+
+function normalizeMentionName(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
 function loadConfig() {
   let stored = {};
   try {
@@ -709,6 +738,7 @@ class QQlightApp {
   constructor() {
     this.config = loadConfig();
     this.historyByChat = new Map();
+    this.groupMembersById = new Map();
     this.activeChat = null;
     this.chatRevision = 0;
     this.exiting = false;
@@ -1567,6 +1597,7 @@ class QQlightApp {
       "  sc                           取消隔离，显示白名单消息（select clear）",
       "  （进入会话后直接输入文字即可发送）",
       "  history [数量]                查看当前隔离聊天的历史消息",
+      "  [QQ号/昵称]消息               群聊中@指定成员并发送消息",
       "  op img [index]               打开图片；1 为最近一张，省略 index 默认使用 1",
       "  status                       查看连接状态",
       "  help                         查看帮助",
@@ -1708,13 +1739,60 @@ class QQlightApp {
     }
   }
 
+  async getGroupMembers(groupId) {
+    const normalizedGroupId = String(groupId);
+    if (!this.groupMembersById) this.groupMembersById = new Map();
+    if (this.groupMembersById.has(normalizedGroupId)) {
+      return this.groupMembersById.get(normalizedGroupId);
+    }
+
+    const response = await this.connection.send("get_group_member_list", {
+      group_id: Number(normalizedGroupId),
+    });
+    const members = Array.isArray(response && response.data) ? response.data : [];
+    this.groupMembersById.set(normalizedGroupId, members);
+    return members;
+  }
+
+  async resolveGroupMention(mention) {
+    if (mention.userId) return mention;
+
+    const members = await this.getGroupMembers(this.activeChat.targetId);
+    const targetName = normalizeMentionName(mention.target);
+    const matches = members.filter((member) => [
+      member && member.card,
+      member && member.nickname,
+      member && member.remark,
+      member && member.title,
+    ].some((name) => normalizeMentionName(name) === targetName));
+
+    if (!matches.length) {
+      throw new Error(`群成员“${mention.target}”不存在，请改用 QQ 号或检查群名片。`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`群成员“${mention.target}”有多个匹配对象，请改用 QQ 号。`);
+    }
+
+    const userId = String(matches[0].user_id || "");
+    if (!/^\d+$/.test(userId)) {
+      throw new Error(`群成员“${mention.target}”缺少有效 QQ 号，无法@。`);
+    }
+    return { ...mention, userId };
+  }
+
   async sendToActiveChat(text, pendingImages = []) {
-    const draft = this.buildDraftMessage(text, pendingImages);
+    let mention = this.activeChat.chatType === "group" ? parseGroupMention(text) : null;
+    if (mention) mention = await this.resolveGroupMention(mention);
+    const draft = this.buildDraftMessage(mention ? mention.text : text, pendingImages);
+    const content = mention ? createAtMessageContent(mention.userId, draft.content) : draft.content;
+    const displayText = mention
+      ? `@${mention.target}${draft.displayText ? ` ${draft.displayText}` : ""}`
+      : draft.displayText;
     return this.sendMessage(
       this.activeChat.chatType,
       this.activeChat.targetId,
-      draft.content,
-      draft.displayText,
+      content,
+      displayText,
     );
   }
 

@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const {
   QQlightApp,
   alignMessageLine,
+  createMessageEvent,
   formatImageError,
   terminalCellWidth,
 } = require("../src/qqlight");
@@ -181,4 +182,66 @@ test("隔离聊天消息按终端宽度将我的消息靠右显示", () => {
     29,
   );
   assert.match(alignMessageLine(line, "outgoing", 30), /^ +12:34/);
+});
+
+test("消息渲染将昵称和正文明确分层", () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.activeChat = null;
+
+  const line = app.renderMessage({
+    time: "2026-10-17T12:34:00.000Z",
+    direction: "incoming",
+    chatType: "group",
+    targetId: "123456",
+    chatName: "测试群",
+    senderName: "小明",
+    text: "你好",
+  });
+
+  assert.match(line, /【小明】 │ 你好/);
+  assert.doesNotMatch(line, /小明: 你好/);
+});
+
+test("B站 JSON 卡片提取视频标题和分享链接", () => {
+  const card = {
+    app: "com.tencent.miniapp_01",
+    desc: "哔哩哔哩",
+    prompt: "[QQ小程序]哔哩哔哩",
+    meta: {
+      detail_1: {
+        title: "哔哩哔哩",
+        desc: "测试视频标题",
+        qqdocurl: "https://b23.tv/test-video",
+      },
+    },
+  };
+  const event = createMessageEvent({
+    post_type: "message",
+    message_type: "private",
+    user_id: 123456,
+    message: [{ type: "json", data: { data: JSON.stringify(card) } }],
+  });
+
+  assert.equal(event.text, "[B站视频] 测试视频标题 | https://b23.tv/test-video");
+});
+
+test("CQ 字符串格式的 B站 JSON 卡片也能提取", () => {
+  const card = JSON.stringify({
+    desc: "哔哩哔哩",
+    meta: {
+      detail_1: {
+        title: "哔哩哔哩",
+        desc: "另一个视频",
+        qqdocurl: "https://b23.tv/another-video",
+      },
+    },
+  }).replace(/,/g, "&#44;");
+  const event = createMessageEvent({
+    post_type: "message",
+    message_type: "private",
+    user_id: 123456,
+    message: `[CQ:json,data=${card}]`,
+  });
+
+  assert.equal(event.text, "[B站视频] 另一个视频 | https://b23.tv/another-video");
 });

@@ -33,12 +33,18 @@ const CONFIG_PATH = process.env.QQLIGHT_CONFIG
 
 const colors = {
   reset: "\x1b[0m",
+  bold: "\x1b[1m",
   dim: "\x1b[2m",
+  gray: "\x1b[90m",
+  blue: "\x1b[34m",
+  brightBlue: "\x1b[94m",
   cyan: "\x1b[36m",
+  brightCyan: "\x1b[96m",
   green: "\x1b[32m",
   yellow: "\x1b[33m",
   red: "\x1b[31m",
   magenta: "\x1b[35m",
+  brightMagenta: "\x1b[95m",
 };
 
 function color(name, value) {
@@ -289,19 +295,139 @@ async function readClipboardImage() {
   throw lastError || new Error("剪贴板中没有图片");
 }
 
+const MESSAGE_SEGMENT_LABELS = {
+  image: "[图片]",
+  record: "[语音]",
+  video: "[视频]",
+  face: "[表情]",
+  file: "[文件]",
+  reply: "[回复]",
+  at: "@某人",
+  json: "[JSON]",
+  xml: "[XML]",
+};
+
+function decodeMessageEntities(value) {
+  return String(value || "")
+    .replace(/&#44;/gi, ",")
+    .replace(/&#91;/gi, "[")
+    .replace(/&#93;/gi, "]")
+    .replace(/&quot;/gi, '"')
+    .replace(/&amp;/gi, "&");
+}
+
+function parseJsonValue(value) {
+  let current = value;
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (current && typeof current === "object") return current;
+    if (typeof current !== "string") return null;
+    const source = decodeMessageEntities(current).trim();
+    if (!source) return null;
+    try {
+      current = JSON.parse(source);
+    } catch {
+      return null;
+    }
+  }
+  return current && typeof current === "object" ? current : null;
+}
+
+function normalizeCardText(value) {
+  return decodeMessageEntities(value)
+    .replace(/\\\//g, "/")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isBilibiliLabel(value) {
+  return /哔哩哔哩|bilibili/i.test(String(value || ""));
+}
+
+function isGenericBilibiliLabel(value) {
+  return /^(?:哔哩哔哩|bilibili)$/i.test(String(value || "").trim());
+}
+
+function isHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value || ""));
+}
+
+function formatBilibiliJsonSegment(data) {
+  const payloadSource = data && typeof data === "object" && Object.prototype.hasOwnProperty.call(data, "data")
+    ? data.data
+    : data;
+  const payload = parseJsonValue(payloadSource);
+  if (!payload) return null;
+
+  const meta = parseJsonValue(payload.meta) || {};
+  const detailCandidates = [
+    parseJsonValue(meta.detail_1),
+    parseJsonValue(meta.detail1),
+    parseJsonValue(payload.detail_1),
+    payload,
+  ].filter((candidate) => candidate && typeof candidate === "object");
+  const detail = detailCandidates.find((candidate) => (
+    candidate.qqdocurl || candidate.jumpUrl || candidate.url || candidate.desc || candidate.title
+  )) || {};
+
+  const urlCandidates = [];
+  [detail, ...detailCandidates, payload].forEach((candidate) => {
+    ["qqdocurl", "jumpUrl", "targetUrl", "shareUrl", "link", "url"].forEach((key) => {
+      const value = normalizeCardText(candidate[key]);
+      if (isHttpUrl(value)) urlCandidates.push(value);
+    });
+  });
+  const url = urlCandidates.find((candidate) => /(?:b23\.tv|bilibili\.com|bili\.com)/i.test(candidate))
+    || urlCandidates.find((candidate) => isHttpUrl(candidate))
+    || "";
+
+  const cardIdentity = [
+    payload.app,
+    payload.desc,
+    payload.prompt,
+    detail.title,
+    detail.qqdocurl,
+    detail.jumpUrl,
+    detail.url,
+  ].map(normalizeCardText).join(" ");
+  if (!isBilibiliLabel(cardIdentity) && !/(?:b23\.tv|bilibili\.com|bili\.com)/i.test(cardIdentity)) {
+    return null;
+  }
+
+  const title = [
+    detail.desc,
+    detail.video_title,
+    detail.videoTitle,
+    detail.name,
+    detail.title,
+    payload.title,
+    payload.prompt,
+  ].map(normalizeCardText)
+    .map((candidate) => candidate.replace(/^\[(?:QQ小程序|分享)\]\s*/i, "").trim())
+    .find((candidate) => candidate && !isGenericBilibiliLabel(candidate))
+    || "未命名视频";
+
+  return `[B站视频] ${title} | ${url || "链接不可用"}`;
+}
+
+function parseCqParameters(value) {
+  const parameters = {};
+  String(value || "").split(",").forEach((part) => {
+    const separator = part.indexOf("=");
+    if (separator < 0) return;
+    const key = part.slice(0, separator).trim();
+    if (!key) return;
+    parameters[key] = decodeMessageEntities(part.slice(separator + 1).trim());
+  });
+  return parameters;
+}
+
 function extractMessageText(message) {
   if (typeof message === "string") {
-    return message.replace(/\[CQ:([^,\]]+)(?:,[^\]]*)?\]/g, (_all, type) => {
-      const labels = {
-        image: "[图片]",
-        record: "[语音]",
-        video: "[视频]",
-        face: "[表情]",
-        file: "[文件]",
-        reply: "[回复]",
-        at: "@某人",
-      };
-      return labels[type] || `[${type}]`;
+    return message.replace(/\[CQ:([^,\]]+)(?:,([^\]]*))?\]/g, (_all, type, rawParameters) => {
+      if (type === "json") {
+        return formatBilibiliJsonSegment(parseCqParameters(rawParameters).data) || MESSAGE_SEGMENT_LABELS.json;
+      }
+      return MESSAGE_SEGMENT_LABELS[type] || `[${type}]`;
     }).trim();
   }
 
@@ -312,17 +438,8 @@ function extractMessageText(message) {
     const data = segment.data || {};
     if (type === "text") return String(data.text || "");
     if (type === "at") return `@${data.name || data.qq || "某人"}`;
-    const labels = {
-      image: "[图片]",
-      record: "[语音]",
-      video: "[视频]",
-      face: "[表情]",
-      file: "[文件]",
-      reply: "[回复]",
-      json: "[JSON]",
-      xml: "[XML]",
-    };
-    return labels[type] || (type ? `[${type}]` : "");
+    if (type === "json") return formatBilibiliJsonSegment(data) || MESSAGE_SEGMENT_LABELS.json;
+    return MESSAGE_SEGMENT_LABELS[type] || (type ? `[${type}]` : "");
   }).join("").trim();
 }
 
@@ -650,6 +767,7 @@ class QQlightApp {
     };
     process.stdin.on("keypress", this.keypressHandler);
     this.rl.on("line", (line) => {
+      this.clearSubmittedInput(line);
       const pendingImages = this.takePendingImages(line);
       this.commandQueue = this.commandQueue
         .then(() => this.runCommand(line, pendingImages))
@@ -681,6 +799,24 @@ class QQlightApp {
     readline.cursorTo(process.stdout, 0);
     process.stdout.write(`${message}\n`);
     if (!this.runningCommand && !this.exiting) this.rl.prompt(true);
+  }
+
+  clearSubmittedInput(line) {
+    if (!this.rl || !process.stdout.isTTY) return;
+
+    const terminalWidth = Math.max(1, Number(process.stdout.columns) || 80);
+    const prompt = typeof this.rl.getPrompt === "function" ? this.rl.getPrompt() : "> ";
+    const inputWidth = terminalCellWidth(`${prompt}${String(line || "")}`);
+    const rowCount = Math.max(1, Math.ceil(Math.max(1, inputWidth) / terminalWidth));
+
+    // readline 已经在提交时换到了下一行，回到输入行清除后再回到当前行，
+    // 这样输入内容不会作为“反馈消息”残留在聊天记录中。
+    process.stdout.write(`\x1b[${rowCount}A\r`);
+    for (let row = 0; row < rowCount; row += 1) {
+      process.stdout.write("\x1b[2K");
+      if (row < rowCount - 1) process.stdout.write("\x1b[1B\r");
+    }
+    if (rowCount > 1) process.stdout.write(`\x1b[${rowCount - 1}A\r`);
   }
 
   async receiveMessage(message) {
@@ -1346,29 +1482,32 @@ class QQlightApp {
   }
 
   renderMessage(message) {
-    const icon = message.direction === "outgoing" ? "↑" : "↓";
+    const isOutgoing = message.direction === "outgoing";
+    const icon = isOutgoing ? "↑" : "↓";
     const kind = message.chatType === "private" ? "私聊" : "群聊";
     const chatLabel = message.chatType === "private"
       ? `${kind} ${message.targetId}`
       : `${kind} ${message.chatName || "（未知群名称）"}`;
-    const sender = message.senderName ? ` ${message.senderName}` : "";
-    const directionColor = message.direction === "outgoing" ? "magenta" : "cyan";
+    const sender = isOutgoing
+      ? "我"
+      : (message.senderName || (message.chatType === "private" ? "对方" : "群成员"));
+    const directionColor = isOutgoing ? "brightMagenta" : "brightCyan";
+    const senderLabel = color(directionColor, color("bold", `【${sender}】`));
+    const separator = color("gray", " │ ");
+    const messageText = String(message.text || "");
+    const time = color("dim", formatTime(message.time));
     const isIsolatedMessage = this.activeChat
       && messageMatchesChat(message, this.activeChat)
       && process.stdout.isTTY;
     if (isIsolatedMessage) {
-      const isolatedSender = message.direction === "outgoing"
-        ? "我"
-        : (message.senderName || (message.chatType === "private" ? "对方" : "群成员"));
       const deliveryStatus = message.deliveryStatus === "failed" ? "failed" : "success";
-      const deliveryDot = message.direction === "outgoing"
-        ? `${color(deliveryStatus === "failed" ? "red" : "green", "●")} `
-        : "";
-      const coloredContent = `${deliveryDot}${color(directionColor, `${isolatedSender}: ${message.text}`)}`;
-      const isolatedLine = `${coloredContent}  ${color("dim", formatTime(message.time))}`;
+      const deliveryDot = isOutgoing
+        ? color(deliveryStatus === "failed" ? "red" : "green", "●")
+        : color(directionColor, "●");
+      const isolatedLine = `${deliveryDot} ${senderLabel}${separator}${messageText}  ${time}`;
       return alignMessageLine(isolatedLine, message.direction, process.stdout.columns);
     }
-    return `${color("dim", formatTime(message.time))} ${color(directionColor, `${icon} ${chatLabel}`)}${sender}: ${message.text}`;
+    return `${time} ${color(directionColor, icon)} ${color("brightBlue", chatLabel)}  ${senderLabel}${separator}${messageText}`;
   }
 
   async runCommand(input, pendingImages = []) {

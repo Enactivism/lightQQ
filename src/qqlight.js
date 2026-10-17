@@ -13,6 +13,11 @@ const IMAGE_PLACEHOLDER = "[图片]";
 const HISTORY_LOAD_LIMIT = 20;
 const HISTORY_DIR = path.resolve(__dirname, "..", ".qqlight", "history");
 const IMAGE_DIR = path.resolve(__dirname, "..", ".qqlight", "images");
+const IMAGE_FETCH_ATTEMPTS = 3;
+const IMAGE_FETCH_TIMEOUT_MS = 8000;
+const IMAGE_FETCH_RETRY_DELAYS_MS = [250, 750];
+const IMAGE_MAX_BYTES = 25 * 1024 * 1024;
+const NAPCAT_IMAGE_RESOLVE_TIMEOUT_MS = 30000;
 
 const DEFAULT_CONFIG = {
   napcatWsUrl: "ws://127.0.0.1:3001",
@@ -39,6 +44,75 @@ const colors = {
 function color(name, value) {
   if (!process.stdout.isTTY) return value;
   return `${colors[name] || ""}${value}${colors.reset}`;
+}
+
+const ANSI_ESCAPE_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+
+function stripAnsi(value) {
+  return String(value || "").replace(ANSI_ESCAPE_PATTERN, "");
+}
+
+function isWideTerminalCodePoint(codePoint) {
+  return (
+    (codePoint >= 0x1100 && codePoint <= 0x115f)
+    || codePoint === 0x2329
+    || codePoint === 0x232a
+    || (codePoint >= 0x2e80 && codePoint <= 0xa4cf)
+    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+    || (codePoint >= 0xfe10 && codePoint <= 0xfe19)
+    || (codePoint >= 0xfe30 && codePoint <= 0xfe6f)
+    || (codePoint >= 0xff01 && codePoint <= 0xff60)
+    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+    || (codePoint >= 0x1f300 && codePoint <= 0x1faff)
+  );
+}
+
+function terminalCellWidth(value) {
+  return [...stripAnsi(value)].reduce((width, character) => {
+    const codePoint = character.codePointAt(0);
+    return width + (isWideTerminalCodePoint(codePoint) ? 2 : 1);
+  }, 0);
+}
+
+function alignMessageLine(line, direction, terminalWidth = process.stdout.columns) {
+  if (direction !== "outgoing") return line;
+  const width = Math.max(20, Number(terminalWidth) || 80);
+  const contentWidth = terminalCellWidth(line);
+  if (contentWidth >= width) return line;
+  return `${" ".repeat(Math.max(0, width - contentWidth - 1))}${line}`;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createSafeImageError(message, { cause, retryable = false } = {}) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.safeForDisplay = true;
+  error.retryable = retryable;
+  return error;
+}
+
+function getSafeErrorCode(error) {
+  let current = error;
+  for (let depth = 0; current && depth < 4; depth += 1) {
+    const code = String(current.code || "").toUpperCase();
+    if (/^[A-Z][A-Z0-9_]{1,63}$/.test(code)) return code;
+    current = current.cause;
+  }
+  return "";
+}
+
+function formatImageError(error) {
+  if (error?.safeForDisplay && error.message) return error.message;
+  const code = getSafeErrorCode(error);
+  return code ? `图片来源不可用（${code}）` : "图片来源不可用";
+}
+
+function isDirectImageValue(value) {
+  const source = String(value || "");
+  return /^(?:base64|data|https?|file):/i.test(source) || path.isAbsolute(source);
 }
 
 function normalizeIds(value) {
@@ -491,16 +565,17 @@ class NapCatConnection {
     if (message && this.isAllowed(message)) this.onMessage(message);
   }
 
-  send(action, params) {
+  send(action, params, { timeoutMs = 15000 } = {}) {
     if (!this.connected) return Promise.reject(new Error("NapCat 尚未连接"));
     const echo = crypto.randomUUID();
     const packet = JSON.stringify({ action, params, echo });
+    const responseTimeoutMs = Math.max(1000, Math.min(60000, Number(timeoutMs) || 15000));
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(echo);
         reject(new Error(`等待 NapCat 响应超时：${action}`));
-      }, 15000);
+      }, responseTimeoutMs);
       this.pending.set(echo, { resolve, reject, timer });
       this.socket.send(packet, (error) => {
         if (!error) return;
@@ -532,6 +607,8 @@ class QQlightApp {
     this.historyWriteQueues = new Map();
     this.persistedMessageKeys = new Map();
     this.messageQueue = Promise.resolve();
+    this.fetchImpl = globalThis.fetch;
+    this.waitImpl = wait;
     this.rl = null;
     this.connection = new NapCatConnection(this.config, {
       onStatus: (status, detail) => {
@@ -656,54 +733,182 @@ class QQlightApp {
     return ".png";
   }
 
+  async fetchImageValue(source, mime = "") {
+    const fetchImpl = this.fetchImpl || globalThis.fetch;
+    const waitImpl = this.waitImpl || wait;
+    let lastError;
+
+    for (let attempt = 0; attempt < IMAGE_FETCH_ATTEMPTS; attempt += 1) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
+      try {
+        const response = await fetchImpl(source, { signal: controller.signal });
+        if (!response.ok) {
+          const retryable = response.status === 408
+            || response.status === 429
+            || response.status >= 500;
+          await response.body?.cancel?.().catch(() => {});
+          throw createSafeImageError(`下载图片失败：HTTP ${response.status}`, { retryable });
+        }
+
+        const contentLength = Number(response.headers.get("content-length"));
+        if (Number.isFinite(contentLength) && contentLength > IMAGE_MAX_BYTES) {
+          await response.body?.cancel?.().catch(() => {});
+          throw createSafeImageError("下载图片失败：图片超过 25 MiB 限制");
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (!buffer.length) {
+          throw createSafeImageError("下载图片失败：图片内容为空", { retryable: true });
+        }
+        if (buffer.length > IMAGE_MAX_BYTES) {
+          throw createSafeImageError("下载图片失败：图片超过 25 MiB 限制");
+        }
+        return {
+          buffer,
+          extension: this.getImageExtension(
+            source,
+            response.headers.get("content-type") || mime,
+          ),
+        };
+      } catch (error) {
+        if (error?.safeForDisplay) {
+          lastError = error;
+        } else if (error?.name === "AbortError") {
+          lastError = createSafeImageError("下载图片超时", { cause: error, retryable: true });
+        } else {
+          const code = getSafeErrorCode(error);
+          lastError = createSafeImageError(
+            `下载图片失败：${code || "网络错误"}`,
+            { cause: error, retryable: true },
+          );
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (!lastError.retryable || attempt >= IMAGE_FETCH_ATTEMPTS - 1) break;
+      const delay = IMAGE_FETCH_RETRY_DELAYS_MS[attempt] || 0;
+      if (delay) await waitImpl(delay);
+    }
+
+    if (lastError?.retryable) {
+      throw createSafeImageError(
+        `${lastError.message}（已尝试 ${IMAGE_FETCH_ATTEMPTS} 次）`,
+        { cause: lastError },
+      );
+    }
+    throw lastError || createSafeImageError("下载图片失败");
+  }
+
   async readImageValue(value, mime = "") {
     const source = String(value || "");
-    if (!source) throw new Error("图片来源为空");
+    if (!source) throw createSafeImageError("图片来源为空");
 
     if (source.startsWith("base64://")) {
       const buffer = Buffer.from(source.slice("base64://".length), "base64");
-      if (!buffer.length) throw new Error("Base64 图片内容为空");
+      if (!buffer.length) throw createSafeImageError("Base64 图片内容为空");
       return { buffer, extension: this.getImageExtension(source, mime) };
     }
 
     if (source.startsWith("data:")) {
       const match = source.match(/^data:([^;,]+)(;base64)?,([\s\S]*)$/i);
-      if (!match) throw new Error("无法解析图片数据 URI");
-      const buffer = match[2]
-        ? Buffer.from(match[3], "base64")
-        : Buffer.from(decodeURIComponent(match[3]), "utf8");
-      if (!buffer.length) throw new Error("图片数据为空");
+      if (!match) throw createSafeImageError("无法解析图片数据 URI");
+      let buffer;
+      try {
+        buffer = match[2]
+          ? Buffer.from(match[3], "base64")
+          : Buffer.from(decodeURIComponent(match[3]), "utf8");
+      } catch (error) {
+        throw createSafeImageError("无法解析图片数据 URI", { cause: error });
+      }
+      if (!buffer.length) throw createSafeImageError("图片数据为空");
       return { buffer, extension: this.getImageExtension(source, match[1]) };
     }
 
     if (/^https?:\/\//i.test(source)) {
-      const response = await fetch(source);
-      if (!response.ok) throw new Error(`下载图片失败：HTTP ${response.status}`);
-      const buffer = Buffer.from(await response.arrayBuffer());
-      if (!buffer.length) throw new Error("下载的图片为空");
-      return {
-        buffer,
-        extension: this.getImageExtension(source, response.headers.get("content-type") || mime),
-      };
+      return this.fetchImageValue(source, mime);
     }
 
-    const imagePath = /^file:\/\//i.test(source) ? fileURLToPath(source) : source;
-    const buffer = await fs.promises.readFile(imagePath);
-    if (!buffer.length) throw new Error("本地图片为空");
-    return { buffer, extension: this.getImageExtension(imagePath, mime) };
+    let imagePath;
+    try {
+      imagePath = /^file:\/\//i.test(source) ? fileURLToPath(source) : source;
+      const buffer = await fs.promises.readFile(imagePath);
+      if (!buffer.length) throw createSafeImageError("本地图片为空");
+      if (buffer.length > IMAGE_MAX_BYTES) {
+        throw createSafeImageError("读取图片失败：图片超过 25 MiB 限制");
+      }
+      return { buffer, extension: this.getImageExtension(imagePath, mime) };
+    } catch (error) {
+      if (error?.safeForDisplay) throw error;
+      const code = getSafeErrorCode(error);
+      throw createSafeImageError(
+        `读取本地图片失败${code ? `：${code}` : ""}`,
+        { cause: error },
+      );
+    }
   }
 
   async readImageSource(source) {
     let lastError;
-    for (const value of [source.file, source.url]) {
-      if (!value) continue;
+    const triedValues = new Set();
+    const readCandidate = async (value, mime = source.type, filename = "") => {
+      const normalizedValue = String(value || "");
+      if (!normalizedValue || triedValues.has(normalizedValue)) return null;
+      triedValues.add(normalizedValue);
       try {
-        return await this.readImageValue(value, source.type);
+        const result = await this.readImageValue(normalizedValue, mime);
+        if (filename && /^(?:base64|data):/i.test(normalizedValue)) {
+          result.extension = this.getImageExtension(filename, mime);
+        }
+        return result;
       } catch (error) {
         lastError = error;
+        return null;
+      }
+    };
+
+    for (const value of [source.url, source.file]) {
+      if (!isDirectImageValue(value)) continue;
+      const result = await readCandidate(value);
+      if (result) return result;
+    }
+
+    const napcatReference = String(source.file || source.url || "");
+    if (napcatReference && !/^(?:base64|data):/i.test(napcatReference)) {
+      try {
+        const response = await this.connection.send(
+          "get_image",
+          { file: napcatReference },
+          { timeoutMs: NAPCAT_IMAGE_RESOLVE_TIMEOUT_MS },
+        );
+        const data = response?.data && typeof response.data === "object" ? response.data : {};
+        const base64 = String(data.base64 || "");
+        // get_image 完成后，同一个 URL 可能才真正可用，因此允许重新下载一次。
+        triedValues.clear();
+        const resolvedValues = [
+          base64 && (/^(?:base64|data):/i.test(base64) ? base64 : `base64://${base64}`),
+          String(data.url || ""),
+          String(data.file || ""),
+        ];
+        for (const value of resolvedValues) {
+          if (!isDirectImageValue(value)) continue;
+          const result = await readCandidate(value, source.type, String(data.file_name || ""));
+          if (result) return result;
+        }
+      } catch (error) {
+        const timedOut = /响应超时/.test(String(error?.message || ""));
+        const code = getSafeErrorCode(error);
+        lastError = createSafeImageError(
+          timedOut
+            ? "NapCat 图片解析超时"
+            : `NapCat 图片解析失败${code ? `（${code}）` : ""}`,
+          { cause: error },
+        );
       }
     }
-    throw lastError || new Error("图片没有可用来源");
+
+    throw lastError || createSafeImageError("图片没有可用来源");
   }
 
   async saveMessageImages(message) {
@@ -731,18 +936,14 @@ class QQlightApp {
         imagePaths.push(imagePath);
         this.lastImagePath = imagePath;
       } catch (error) {
-        this.writeLine(color("red", `[错误] ${directionLabel}图片保存失败：${error.message}`));
+        this.writeLine(color("red", `[错误] ${directionLabel}图片保存失败：${formatImageError(error)}`));
       }
     }
     return { ...message, imagePaths };
   }
 
   getPrompt() {
-    if (!this.activeChat) return "> ";
-    if (this.activeChat.chatType === "private") {
-      return `${this.activeChat.displayName || this.activeChat.targetId} > `;
-    }
-    return `群聊 ${this.activeChat.displayName || "（正在获取群名称）"} > `;
+    return "> ";
   }
 
   updatePrompt() {
@@ -904,6 +1105,9 @@ class QQlightApp {
       id: String(message.id),
       time: message.time,
       direction: message.direction,
+      deliveryStatus: message.direction === "outgoing"
+        ? (message.deliveryStatus === "failed" ? "failed" : "success")
+        : "",
       chatType: message.chatType,
       targetId: String(message.targetId),
       chatName: message.chatType === "group" ? normalizeChatName(message.chatName) : "",
@@ -979,6 +1183,9 @@ class QQlightApp {
             id: String(record.id),
             time: record.time || Date.now(),
             direction: record.direction,
+            deliveryStatus: record.direction === "outgoing" && record.deliveryStatus === "failed"
+              ? "failed"
+              : record.direction === "outgoing" ? "success" : "",
             chatType: record.chatType,
             targetId: chat.targetId,
             chatName: record.chatType === "group" ? normalizeChatName(record.chatName) : "",
@@ -1145,6 +1352,21 @@ class QQlightApp {
       : `${kind} ${message.chatName || "（未知群名称）"}`;
     const sender = message.senderName ? ` ${message.senderName}` : "";
     const directionColor = message.direction === "outgoing" ? "magenta" : "cyan";
+    const isIsolatedMessage = this.activeChat
+      && messageMatchesChat(message, this.activeChat)
+      && process.stdout.isTTY;
+    if (isIsolatedMessage) {
+      const isolatedSender = message.direction === "outgoing"
+        ? "我"
+        : (message.senderName || (message.chatType === "private" ? "对方" : "群成员"));
+      const deliveryStatus = message.deliveryStatus === "failed" ? "failed" : "success";
+      const deliveryDot = message.direction === "outgoing"
+        ? `${color(deliveryStatus === "failed" ? "red" : "green", "●")} `
+        : "";
+      const coloredContent = `${deliveryDot}${color(directionColor, `${isolatedSender}: ${message.text}`)}`;
+      const isolatedLine = `${coloredContent}  ${color("dim", formatTime(message.time))}`;
+      return alignMessageLine(isolatedLine, message.direction, process.stdout.columns);
+    }
     return `${color("dim", formatTime(message.time))} ${color(directionColor, `${icon} ${chatLabel}`)}${sender}: ${message.text}`;
   }
 
@@ -1363,14 +1585,11 @@ class QQlightApp {
       ? { user_id: Number(targetId), message: content }
       : { group_id: Number(targetId), message: content };
 
-    const response = await this.connection.send(action, params);
-    const responseMessageId = response && response.data && response.data.message_id;
     const message = {
-      id: responseMessageId === undefined || responseMessageId === null
-        ? `local-${Date.now()}`
-        : String(responseMessageId),
+      id: `local-${Date.now()}-${crypto.randomUUID()}`,
       time: Date.now(),
       direction: "outgoing",
+      deliveryStatus: "success",
       chatType,
       targetId,
       senderId: "",
@@ -1383,10 +1602,29 @@ class QQlightApp {
       rawMessage: typeof content === "string" ? content : safeJson(content),
       imageSources: extractImageSources(content),
     };
+    let response;
+    try {
+      response = await this.connection.send(action, params);
+    } catch {
+      message.id = `failed-${Date.now()}-${crypto.randomUUID()}`;
+      message.deliveryStatus = "failed";
+      const storedFailedMessage = await this.saveMessageImages(message);
+      if (this.addToHistory(storedFailedMessage)) {
+        await this.persistMessage(storedFailedMessage);
+        if (messageMatchesChat(storedFailedMessage, this.activeChat)) {
+          this.writeLine(this.renderMessage(storedFailedMessage));
+        }
+      }
+      return;
+    }
+    const responseMessageId = response && response.data && response.data.message_id;
+    if (responseMessageId !== undefined && responseMessageId !== null) {
+      message.id = String(responseMessageId);
+    }
     const existingMessage = this.getHistoryMessage(message);
     if (existingMessage) {
       if (messageMatchesChat(existingMessage, this.activeChat)) {
-        this.writeLine(color("green", "发送成功") + ` ${this.renderMessage(existingMessage)}`);
+        this.writeLine(this.renderMessage(existingMessage));
       }
       return;
     }
@@ -1394,7 +1632,7 @@ class QQlightApp {
     if (!this.addToHistory(storedMessage)) return;
     await this.persistMessage(storedMessage);
     if (messageMatchesChat(storedMessage, this.activeChat)) {
-      this.writeLine(color("green", "发送成功") + ` ${this.renderMessage(storedMessage)}`);
+      this.writeLine(this.renderMessage(storedMessage));
     } else {
       this.writeLine(color("green", "发送成功（当前会话已隔离）"));
     }
@@ -1420,5 +1658,8 @@ module.exports = {
   QQlightApp,
   NapCatConnection,
   createMessageEvent,
+  formatImageError,
+  alignMessageLine,
+  terminalCellWidth,
   messageMatchesChat,
 };

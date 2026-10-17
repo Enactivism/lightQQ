@@ -10,7 +10,8 @@
   },
   "scripts": {
     "start": "node src/qqlight.js",
-    "dev": "node --watch src/qqlight.js"
+    "dev": "node --watch src/qqlight.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

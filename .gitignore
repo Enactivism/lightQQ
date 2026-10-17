@@ -20,6 +20,12 @@ venv/
 config.json
 config.*.json
 !config.example.json
+token.json
+tokens.json
+auth.json
+credentials.json
+secrets.json
+cookies.json
 *.local
 *.local.*
 *.secret
@@ -60,9 +66,15 @@ uploads/
 *.sqlite3-*
 *.session
 *.session.*
+*.cookie
+*.cookies
+*.ndjson
 *.jsonl
 *.history
 *.history.*
+browser-data/
+user-data/
+profiles/
 
 # Logs and diagnostic dumps
 logs/
@@ -71,6 +83,9 @@ logs/
 *.dump
 *.trace
 *.out
+*.har
+*.pcap
+*.pcapng
 core
 core.*
 *.core
@@ -126,15 +141,22 @@ ehthumbs.db
 *.jpeg
 *.gif
 *.webp
+*.avif
+*.svg
+*.ico
 *.heic
 *.bmp
 *.tiff
 *.mp3
 *.wav
 *.ogg
+*.flac
+*.m4a
 *.mp4
 *.mov
 *.mkv
+*.webm
+*.pdf
 *.zip
 *.7z
 *.rar

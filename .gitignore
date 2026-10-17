@@ -1,5 +1,7 @@
 # Dependencies and generated output
 node_modules/
+.npm/
+.pnpm-store/
 dist/
 build/
 coverage/
@@ -128,6 +130,8 @@ id_ed25519*
 .DS_Store
 Thumbs.db
 ehthumbs.db
+.eslintcache
+.stylelintcache
 *.swp
 *.swo
 *~

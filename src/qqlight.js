@@ -126,6 +126,10 @@ function normalizeIds(value) {
   return [...new Set(values.map((item) => String(item).trim()).filter((item) => /^\d+$/.test(item)))];
 }
 
+function mergeIds(existing, additions) {
+  return normalizeIds([...normalizeIds(existing), ...normalizeIds(additions)]);
+}
+
 function parseGroupMention(value) {
   const source = String(value || "").trim();
   const bracketMatch = source.match(/^\[([^\]\r\n]+)\]([\s\S]*)$/);
@@ -153,6 +157,20 @@ function createAtMessageContent(userId, content) {
 
 function normalizeMentionName(value) {
   return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function getGroupMemberNameCandidates(member) {
+  return [member && member.card, member && member.nickname, member && member.remark, member && member.title]
+    .map((value) => String(value || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .filter((value, index, values) => values.indexOf(value) === index);
+}
+
+function getGroupMemberDisplayName(member) {
+  const names = getGroupMemberNameCandidates(member);
+  if (!names.length) return "（未设置昵称）";
+  if (names.length === 1) return names[0];
+  return `${names[0]}（昵称：${names[1]}）`;
 }
 
 function loadConfig() {
@@ -1570,6 +1588,7 @@ class QQlightApp {
       if (lower === "quit" || lower === "exit" || lower === "q") return this.exit();
       if (/^(sp|sg|sc)(?:\s|$)/.test(lower)) return await this.selectChat(command);
       if (lower === "history" || lower.startsWith("history ")) return this.showHistory(command);
+      if (/^gls(?:\s|$)/.test(lower)) return await this.showGroupMembers(command);
       if (/^(fp|fg)(?:\s|$)/.test(lower)) return this.setFilter(command);
       if (this.activeChat && !line.startsWith("/")) {
         return await this.sendToActiveChat(line, pendingImages);
@@ -1587,8 +1606,8 @@ class QQlightApp {
     [
       "命令：",
       "  ls                           查看私聊和群聊白名单",
-      "  fp <QQ号...>                 设置私聊白名单（filter private）",
-      "  fg <群号...>                 设置群聊白名单（filter group）",
+      "  fp <QQ号...>                 追加私聊白名单（filter private）",
+      "  fg <群号...>                 追加群聊白名单（filter group）",
       "  fp clear                     清空私聊白名单（filter private clear）",
       "  fg clear                     清空群聊白名单（filter group clear）",
       "  sp <QQ号>                    进入私聊并隔离其他消息（select private）",
@@ -1598,6 +1617,7 @@ class QQlightApp {
       "  （进入会话后直接输入文字即可发送）",
       "  history [数量]                查看当前隔离聊天的历史消息",
       "  [QQ号/昵称]消息               群聊中@指定成员并发送消息",
+      "  gls [关键词]                  列出群成员或按昵称模糊搜索",
       "  op img [index]               打开图片；1 为最近一张，省略 index 默认使用 1",
       "  status                       查看连接状态",
       "  help                         查看帮助",
@@ -1641,15 +1661,19 @@ class QQlightApp {
     if (/^all$/i.test(value)) {
       throw new Error("当前仅支持白名单模式，不能设置为接收全部；请使用 clear 清空白名单");
     }
-    const ids = clearsWhitelist ? [] : normalizeIds(value);
-    if (!ids.length && !clearsWhitelist) {
+    const additions = clearsWhitelist ? [] : normalizeIds(value);
+    if (!additions.length && !clearsWhitelist) {
       throw new Error("没有解析到有效的数字 ID");
     }
+    const currentIds = kind === "private" ? this.config.privateIds : this.config.groupIds;
+    const ids = clearsWhitelist ? [] : mergeIds(currentIds, additions);
     if (kind === "private") this.config.privateIds = ids;
     else this.config.groupIds = ids;
     saveConfig(this.config);
     const label = kind === "private" ? "私聊" : "群聊";
-    this.writeLine(color("green", `${label}白名单已更新：${ids.length ? ids.join(", ") : "空（不接收）"}`));
+    this.writeLine(color("green", clearsWhitelist
+      ? `${label}白名单已清空。`
+      : `${label}白名单已添加：${additions.join(", ")}；当前共 ${ids.length} 个：${ids.join(", ")}`));
   }
 
   showHistory(command) {
@@ -1754,17 +1778,48 @@ class QQlightApp {
     return members;
   }
 
+  async showGroupMembers(command) {
+    if (!this.activeChat || this.activeChat.chatType !== "group") {
+      this.writeLine(color("yellow", "gls 只能在群聊隔离会话中使用，请先使用 sg <群号>。"));
+      return;
+    }
+
+    const query = String(command || "").replace(/^gls/i, "").trim();
+    let members;
+    try {
+      members = await this.getGroupMembers(this.activeChat.targetId);
+    } catch (error) {
+      throw new Error(`群成员列表获取失败：${error.message}`);
+    }
+
+    const normalizedQuery = normalizeMentionName(query);
+    const matches = normalizedQuery
+      ? members.filter((member) => getGroupMemberNameCandidates(member)
+        .some((name) => normalizeMentionName(name).includes(normalizedQuery)))
+      : members;
+    if (!matches.length) {
+      this.writeLine(color("yellow", query
+        ? `没有找到名称包含“${query}”的群成员。`
+        : "当前群没有可显示的成员。"));
+      return;
+    }
+
+    this.writeLine(color("cyan", query
+      ? `匹配“${query}”的群成员（${matches.length}）：`
+      : `群成员（${matches.length}）：`));
+    matches.forEach((member, index) => {
+      const userId = String(member && member.user_id || "未知QQ号");
+      this.writeLine(`  ${index + 1}. ${getGroupMemberDisplayName(member)}  [${userId}]`);
+    });
+  }
+
   async resolveGroupMention(mention) {
     if (mention.userId) return mention;
 
     const members = await this.getGroupMembers(this.activeChat.targetId);
     const targetName = normalizeMentionName(mention.target);
-    const matches = members.filter((member) => [
-      member && member.card,
-      member && member.nickname,
-      member && member.remark,
-      member && member.title,
-    ].some((name) => normalizeMentionName(name) === targetName));
+    const matches = members.filter((member) => getGroupMemberNameCandidates(member)
+      .some((name) => normalizeMentionName(name) === targetName));
 
     if (!matches.length) {
       throw new Error(`群成员“${mention.target}”不存在，请改用 QQ 号或检查群名片。`);
@@ -1877,6 +1932,7 @@ module.exports = {
   NapCatConnection,
   createMessageEvent,
   formatImageError,
+  mergeIds,
   alignMessageLine,
   terminalCellWidth,
   messageMatchesChat,

@@ -6,6 +6,7 @@ const {
   alignMessageLine,
   createMessageEvent,
   formatImageError,
+  mergeIds,
   terminalCellWidth,
 } = require("../src/qqlight");
 
@@ -296,4 +297,33 @@ test("群聊可以按群名片解析昵称并@成员", async () => {
     ],
     "@叉叉.L 你好",
   ]);
+});
+
+test("gls 可以列出或模糊搜索群成员", async () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.activeChat = { chatType: "group", targetId: "987654" };
+  app.groupMembersById = new Map([[
+    "987654",
+    [
+      { user_id: 123456789, card: "叉叉.L", nickname: "测试昵称" },
+      { user_id: 222222222, card: "小明", nickname: "小明" },
+      { user_id: 333333333, card: "", nickname: "叉烧" },
+    ],
+  ]]);
+  const output = [];
+  app.writeLine = (line) => output.push(line);
+
+  await app.showGroupMembers("gls 叉");
+
+  assert.match(output[0], /匹配“叉”的群成员（2）：/);
+  assert.match(output[1], /叉叉\.L.*123456789/);
+  assert.match(output[2], /叉烧.*333333333/);
+  assert.doesNotMatch(output.join("\n"), /小明/);
+});
+
+test("白名单追加会保留已有号码并自动去重", () => {
+  assert.deepEqual(
+    mergeIds(["123456789", "222222222"], ["222222222", "333333333"]),
+    ["123456789", "222222222", "333333333"],
+  );
 });

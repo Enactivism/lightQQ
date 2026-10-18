@@ -536,6 +536,18 @@ test("聊天头部显示群聊名称和当前时间", () => {
   assert.doesNotMatch(lines.join("\n"), /╭─|╰─/);
 });
 
+test("上下文窗口按终端实际换行保留完整的最新消息气泡", () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.chatScrollOffset = 0;
+  const latestBlock = ["╭─ 我 14:58:23 ✓", "╰─ "+"正文".repeat(30)];
+  const window = app.getChatContextWindow([
+    ["╭─ 对方 14:57:00 •", "╰─ 旧消息"],
+    latestBlock,
+  ], 4);
+
+  assert.deepEqual(window.lines, latestBlock);
+});
+
 test("隔离聊天上下文可以按页向上和向下翻阅", () => {
   const app = Object.create(QQlightApp.prototype);
   app.activeChat = { chatType: "private", targetId: "123456" };

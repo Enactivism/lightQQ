@@ -1154,7 +1154,11 @@ class QQlightApp {
   }
 
   getChatContextWindow(blocks = this.getRenderedChatContextBlocks(), viewportRows = this.getChatViewportRows()) {
-    const blockRows = blocks.map((block) => Math.max(1, block.length));
+    const terminalWidth = Math.max(1, Number(process.stdout.columns) || 80);
+    const blockRows = blocks.map((block) => Math.max(
+      1,
+      block.reduce((rows, line) => rows + terminalRowCount(line, terminalWidth), 0),
+    ));
     let oldestEnd = 0;
     let oldestRows = 0;
     for (let index = 0; index < blockRows.length; index += 1) {

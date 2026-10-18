@@ -31,6 +31,8 @@ const NAPCAT_IMAGE_RESOLVE_TIMEOUT_MS = 30000;
 // 图片来源失败时按“能解释清楚原因”的优先级挑选最终提示：下载失败最能说明问题，
 // NapCat 解析失败次之，本地文件读不到（ENOENT）最没有参考价值，不能让它盖掉真正的原因。
 const IMAGE_ERROR_PRIORITY = { download: 3, napcat: 2, local: 1 };
+const CHAT_HEADER_HEIGHT = 4;
+const CHAT_SCROLL_PAGE_SIZE = 5;
 
 const DEFAULT_CONFIG = {
   napcatWsUrl: "ws://127.0.0.1:3001",
@@ -991,6 +993,8 @@ class QQlightApp {
     this.groupSenderColors = new Map();
     this.activeChat = null;
     this.chatHeader = null;
+    this.chatScrollOffset = 0;
+    this.chatHistoryLoadState = new Map();
     this.chatRevision = 0;
     this.exiting = false;
     this.runningCommand = false;
@@ -1042,7 +1046,7 @@ class QQlightApp {
       completer: (line) => this.completeInput(line),
     });
     readline.emitKeypressEvents(process.stdin, this.rl);
-    this.keypressHandler = (_sequence, key) => {
+    this.keypressHandler = (sequence, key) => {
       if (key?.name === "paste-start" || key?.sequence === BRACKETED_PASTE_START) {
         this.beginPasteSession("bracketed");
         return;
@@ -1051,7 +1055,21 @@ class QQlightApp {
         this.finishPasteSession();
         return;
       }
+      const rawCtrlArrow = String(sequence || key?.sequence || "")
+        .match(/^\u001b\[(?:1;5|5)([AB])$/);
+      if (rawCtrlArrow) {
+        this.scrollChatContext(rawCtrlArrow[1] === "A" ? 1 : -1);
+        return;
+      }
       if (!key || !key.ctrl) return;
+      if (key.name === "up") {
+        this.scrollChatContext(1);
+        return;
+      }
+      if (key.name === "down") {
+        this.scrollChatContext(-1);
+        return;
+      }
       if (key.name === "c" && !key.shift) {
         this.clearCurrentInput();
         return;
@@ -1119,6 +1137,105 @@ class QQlightApp {
     if (rowCount > 1) process.stdout.write(`\x1b[${rowCount - 1}A\r`);
   }
 
+  getChatViewportRows() {
+    const terminalRows = Math.max(CHAT_HEADER_HEIGHT + 2, Number(process.stdout.rows) || 24);
+    return Math.max(1, terminalRows - CHAT_HEADER_HEIGHT - 1);
+  }
+
+  getRenderedChatContextBlocks() {
+    if (!this.activeChat) return [];
+    return this.getVisibleHistory().flatMap((message) => (
+      [String(this.renderMessage(message) || "").split("\n")]
+    ));
+  }
+
+  getRenderedChatContextLines() {
+    return this.getRenderedChatContextBlocks().flat();
+  }
+
+  getChatContextWindow(blocks = this.getRenderedChatContextBlocks(), viewportRows = this.getChatViewportRows()) {
+    const blockRows = blocks.map((block) => Math.max(1, block.length));
+    let oldestEnd = 0;
+    let oldestRows = 0;
+    for (let index = 0; index < blockRows.length; index += 1) {
+      if (oldestEnd > 0 && oldestRows + blockRows[index] > viewportRows) break;
+      oldestEnd = index + 1;
+      oldestRows += blockRows[index];
+      if (oldestRows >= viewportRows) break;
+    }
+
+    const maxOffset = Math.max(0, blocks.length - oldestEnd);
+    const offset = Math.max(0, Math.min(this.chatScrollOffset, maxOffset));
+    const end = Math.max(0, blocks.length - offset);
+    let start = end;
+    let visibleRows = 0;
+    while (start > 0) {
+      const rows = blockRows[start - 1];
+      if (start < end && visibleRows + rows > viewportRows) break;
+      start -= 1;
+      visibleRows += rows;
+      if (visibleRows >= viewportRows) break;
+    }
+
+    return {
+      maxOffset,
+      lines: blocks.slice(start, end).flat(),
+    };
+  }
+
+  redrawChatViewport(blocks = this.getRenderedChatContextBlocks()) {
+    if (!this.rl || !this.activeChat || !process.stdout.isTTY) return;
+
+    const terminalRows = Math.max(CHAT_HEADER_HEIGHT + 2, Number(process.stdout.rows) || 24);
+    const viewportRows = this.getChatViewportRows();
+    const window = this.getChatContextWindow(blocks, viewportRows);
+    const maxOffset = window.maxOffset;
+    this.chatScrollOffset = Math.max(0, Math.min(this.chatScrollOffset, maxOffset));
+
+    // 顶栏占据前四行，聊天内容从第五行开始；清空内容区后只重绘当前上下文，
+    // 最后把光标放回底部交给 readline 重绘输入栏，避免顶栏和输入内容互相覆盖。
+    process.stdout.write(`\u001b[${CHAT_HEADER_HEIGHT + 1};1H\u001b[J`);
+    if (window.lines.length) process.stdout.write(window.lines.join("\n"));
+    process.stdout.write(`\u001b[${terminalRows};1H\u001b[2K`);
+    this.pinChatHeader();
+    this.rl.prompt(true);
+  }
+
+  scrollChatContext(direction) {
+    if (!this.activeChat || !this.rl) return;
+    const blocks = this.getRenderedChatContextBlocks();
+    const viewportRows = this.getChatViewportRows();
+    const maxOffset = this.getChatContextWindow(blocks, viewportRows).maxOffset;
+    const step = CHAT_SCROLL_PAGE_SIZE;
+    if (direction > 0 && this.chatScrollOffset >= maxOffset) {
+      const state = this.getChatHistoryLoadState(this.activeChat);
+      if (state.hasMore) {
+        return this.loadOlderChatHistory(this.activeChat, this.chatRevision, step)
+          .catch((error) => {
+            this.writeLine(color("red", `[错误] 更早聊天记录加载失败：${error.message}`));
+          });
+      }
+    }
+    if (!maxOffset) return;
+
+    const nextOffset = Math.max(
+      0,
+      Math.min(maxOffset, this.chatScrollOffset + (direction > 0 ? step : -step)),
+    );
+    if (nextOffset === this.chatScrollOffset) return;
+    this.chatScrollOffset = nextOffset;
+    this.redrawChatViewport(blocks);
+  }
+
+  displayActiveMessage(message) {
+    if (this.chatScrollOffset > 0 && this.activeChat) {
+      this.chatScrollOffset = 0;
+      this.redrawChatViewport();
+      return;
+    }
+    this.writeLine(this.renderMessage(message));
+  }
+
   async receiveMessage(message) {
     if (this.getHistoryMessage(message) || this.isRecentOutgoingImageDuplicate(message)) return;
     const needsImageSave = Boolean(message.imageSources?.length);
@@ -1144,7 +1261,7 @@ class QQlightApp {
       this.updatePrompt();
     }
     if (messageMatchesChat(historyMessage, this.activeChat)) {
-      this.writeLine(this.renderMessage(historyMessage));
+      this.displayActiveMessage(historyMessage);
     }
     if (needsImageSave) this.scheduleImageSave(historyMessage);
   }
@@ -1507,6 +1624,7 @@ class QQlightApp {
   renderChatHeader(chat = this.activeChat) {
     if (!chat) return;
     this.chatHeader = null;
+    this.chatScrollOffset = 0;
     const currentTime = formatTime(Date.now());
     const lines = this.getChatHeaderLines(chat, currentTime);
     lines.forEach((line) => this.writeLine(line));
@@ -1527,7 +1645,7 @@ class QQlightApp {
 
   clearChatHeader() {
     if (process.stdout.isTTY && this.chatHeader) {
-      const lineCount = this.chatHeader.lineCount || 4;
+      const lineCount = this.chatHeader.lineCount || CHAT_HEADER_HEIGHT;
       const cleared = Array.from({ length: lineCount }, (_, index) => (
         `\u001b[2K${index < lineCount - 1 ? "\n" : ""}`
       )).join("");
@@ -1787,6 +1905,46 @@ class QQlightApp {
     return this.historyByChat.get(this.getChatHistoryKey(chat.chatType, chat.targetId)) || [];
   }
 
+  getChatHistoryLoadState(chat) {
+    if (!this.chatHistoryLoadState) this.chatHistoryLoadState = new Map();
+    const chatKey = this.getChatHistoryKey(chat.chatType, chat.targetId);
+    let state = this.chatHistoryLoadState.get(chatKey);
+    if (!state) {
+      state = {
+        loadedCount: this.getChatHistory(chat).length,
+        hasMore: true,
+        loading: null,
+      };
+      this.chatHistoryLoadState.set(chatKey, state);
+    }
+    return state;
+  }
+
+  mergeLoadedChatHistory(chat, messages) {
+    const chatKey = this.getChatHistoryKey(chat.chatType, chat.targetId);
+    const recordsByKey = new Map();
+    [...messages, ...this.getChatHistory(chat)].forEach((message) => {
+      const key = messageKey(message);
+      const previous = recordsByKey.get(key);
+      if (!previous) {
+        recordsByKey.set(key, message);
+        return;
+      }
+      recordsByKey.set(key, {
+        ...previous,
+        ...message,
+        imagePaths: message.imagePaths?.length ? message.imagePaths : previous.imagePaths,
+      });
+    });
+
+    const maxHistory = Math.max(20, Math.min(2000, Number(this.config?.maxHistory) || DEFAULT_CONFIG.maxHistory));
+    const merged = [...recordsByKey.values()]
+      .sort((left, right) => (Number(left.time) || 0) - (Number(right.time) || 0))
+      .slice(-maxHistory);
+    this.historyByChat.set(chatKey, merged);
+    return merged;
+  }
+
   getHistoryMessage(message) {
     return this.getChatHistory(message).find((item) => messageKey(item) === messageKey(message)) || null;
   }
@@ -1939,7 +2097,13 @@ class QQlightApp {
   async loadChatHistory(chat, revision, { display = true } = {}) {
     const chatKey = this.getChatHistoryKey(chat.chatType, chat.targetId);
     await (this.historyWriteQueues.get(chatKey) || Promise.resolve()).catch(() => {});
-    const messages = await this.readChatHistory(chat);
+    const state = this.getChatHistoryLoadState(chat);
+    const maxHistory = Math.max(20, Math.min(2000, Number(this.config?.maxHistory) || DEFAULT_CONFIG.maxHistory));
+    const loadLimit = Math.max(
+      HISTORY_LOAD_LIMIT,
+      Math.min(maxHistory, state.loadedCount || HISTORY_LOAD_LIMIT),
+    );
+    const messages = await this.readChatHistory(chat, loadLimit);
     if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return [];
     const storedChatName = messages
       .slice()
@@ -1949,11 +2113,56 @@ class QQlightApp {
       chat.displayName = storedChatName;
       this.updatePrompt();
     }
-    messages.forEach((message) => this.addToHistory(message));
+    this.mergeLoadedChatHistory(chat, messages);
+    state.loadedCount = messages.length;
+    state.hasMore = messages.length >= loadLimit && messages.length < maxHistory;
+    state.loading = null;
     if (!display || !messages.length) return messages;
-    this.writeLine(color("dim", `已加载最近 ${messages.length} 条本地聊天记录。`));
-    messages.forEach((message) => this.writeLine(this.renderMessage(message)));
+    const visibleMessages = messages.slice(-HISTORY_LOAD_LIMIT);
+    this.writeLine(color("dim", `已加载最近 ${visibleMessages.length} 条本地聊天记录。`));
+    visibleMessages.forEach((message) => this.writeLine(this.renderMessage(message)));
     return messages;
+  }
+
+  loadOlderChatHistory(chat, revision, step) {
+    const state = this.getChatHistoryLoadState(chat);
+    if (!state.hasMore) return Promise.resolve(false);
+    if (state.loading) return state.loading;
+
+    const maxHistory = Math.max(20, Math.min(2000, Number(this.config?.maxHistory) || DEFAULT_CONFIG.maxHistory));
+    const currentLimit = Math.max(HISTORY_LOAD_LIMIT, state.loadedCount || HISTORY_LOAD_LIMIT);
+    const nextLimit = Math.min(maxHistory, currentLimit + HISTORY_LOAD_LIMIT);
+    if (nextLimit <= currentLimit) {
+      state.hasMore = false;
+      return Promise.resolve(false);
+    }
+
+    const previousOffset = this.chatScrollOffset;
+    const loadPromise = this.readChatHistory(chat, nextLimit)
+      .then((messages) => {
+        if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return false;
+        const previousCount = this.getChatHistory(chat).length;
+        this.mergeLoadedChatHistory(chat, messages);
+        state.loadedCount = messages.length;
+        state.hasMore = messages.length >= nextLimit && messages.length < maxHistory;
+
+        const blocks = this.getRenderedChatContextBlocks();
+        const viewportRows = this.getChatViewportRows();
+        const maxOffset = this.getChatContextWindow(blocks, viewportRows).maxOffset;
+        this.chatScrollOffset = Math.min(maxOffset, previousOffset + step);
+        this.redrawChatViewport(blocks);
+        return messages.length > previousCount;
+      });
+    state.loading = loadPromise;
+    loadPromise.then(
+      () => {
+        if (state.loading === loadPromise) state.loading = null;
+      },
+      () => {
+        if (state.loading === loadPromise) state.loading = null;
+      },
+    );
+    return loadPromise;
   }
 
   async findStoredImageCandidates() {
@@ -2182,6 +2391,7 @@ class QQlightApp {
       "  sc                           取消隔离，显示白名单消息（select clear）",
       "  （进入会话后直接输入文字即可发送）",
       "  history [数量]                查看当前隔离聊天的历史消息",
+      "  Ctrl+↑ / Ctrl+↓              向上或向下翻阅当前聊天上下文",
       "  [QQ号/昵称]消息               群聊中@指定成员并发送消息",
       "  gls [关键词]                  列出群成员或按昵称模糊搜索",
       "  op img [index]               打开图片；1 为最近一张，省略 index 默认使用 1",
@@ -2251,6 +2461,7 @@ class QQlightApp {
     const visibleHistory = this.getVisibleHistory();
     const count = countText ? Math.max(1, Math.min(visibleHistory.length, Number(countText) || 20)) : 20;
     const items = visibleHistory.slice(-count);
+    this.chatScrollOffset = 0;
     this.renderChatHeader(this.activeChat);
     if (!items.length) {
       this.writeLine(color("dim", this.activeChat ? "当前会话没有消息历史。" : "当前没有消息历史。"));
@@ -2263,6 +2474,7 @@ class QQlightApp {
     if (/^sc$/i.test(command)) {
       this.clearChatHeader();
       this.activeChat = null;
+      this.chatScrollOffset = 0;
       this.chatRevision += 1;
       this.updatePrompt();
       this.writeLine(color("green", "已取消会话隔离，显示白名单消息。"));
@@ -2287,6 +2499,7 @@ class QQlightApp {
     const revision = ++this.chatRevision;
     this.clearChatHeader();
     this.activeChat = chat;
+    this.chatScrollOffset = 0;
     this.updatePrompt();
     let messages = [];
     try {
@@ -2301,8 +2514,9 @@ class QQlightApp {
 
     this.renderChatHeader(chat);
     if (messages.length) {
-      this.writeLine(color("dim", `已加载最近 ${messages.length} 条本地聊天记录。`));
-      messages.forEach((message) => this.writeLine(this.renderMessage(message)));
+      const visibleMessages = messages.slice(-HISTORY_LOAD_LIMIT);
+      this.writeLine(color("dim", `已加载最近 ${visibleMessages.length} 条本地聊天记录。`));
+      visibleMessages.forEach((message) => this.writeLine(this.renderMessage(message)));
     }
     if (chat.chatType === "private") this.loadPrivateNickname(chat, revision);
   }
@@ -2461,7 +2675,7 @@ class QQlightApp {
       if (this.addToHistory(storedFailedMessage)) {
         await this.persistMessage(storedFailedMessage);
         if (messageMatchesChat(storedFailedMessage, this.activeChat)) {
-          this.writeLine(this.renderMessage(storedFailedMessage));
+          this.displayActiveMessage(storedFailedMessage);
         }
       }
       return;
@@ -2473,7 +2687,7 @@ class QQlightApp {
     const existingMessage = this.getHistoryMessage(message);
     if (existingMessage) {
       if (messageMatchesChat(existingMessage, this.activeChat)) {
-        this.writeLine(this.renderMessage(existingMessage));
+        this.displayActiveMessage(existingMessage);
       }
       return;
     }
@@ -2481,7 +2695,7 @@ class QQlightApp {
     if (!this.addToHistory(storedMessage)) return;
     await this.persistMessage(storedMessage);
     if (messageMatchesChat(storedMessage, this.activeChat)) {
-      this.writeLine(this.renderMessage(storedMessage));
+      this.displayActiveMessage(storedMessage);
     } else {
       this.writeLine(color("green", "发送成功（当前会话已隔离）"));
     }

@@ -536,6 +536,75 @@ test("聊天头部显示群聊名称和当前时间", () => {
   assert.doesNotMatch(lines.join("\n"), /╭─|╰─/);
 });
 
+test("隔离聊天上下文可以按页向上和向下翻阅", () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.activeChat = { chatType: "private", targetId: "123456" };
+  app.chatScrollOffset = 0;
+  app.rl = {};
+  app.getVisibleHistory = () => Array.from({ length: 60 }, (_value, index) => ({ index }));
+  app.renderMessage = (message) => `消息 ${message.index}`;
+  const redraws = [];
+  app.redrawChatViewport = (lines) => redraws.push({ offset: app.chatScrollOffset, lines });
+
+  app.scrollChatContext(1);
+  const firstOffset = app.chatScrollOffset;
+  app.scrollChatContext(1);
+  const secondOffset = app.chatScrollOffset;
+  app.scrollChatContext(-1);
+  assert.equal(app.chatScrollOffset, firstOffset);
+  app.scrollChatContext(-1);
+
+  assert.ok(firstOffset > 0);
+  assert.ok(secondOffset > firstOffset);
+  assert.equal(app.chatScrollOffset, 0);
+  assert.equal(redraws.length, 4);
+  assert.equal(redraws[0].lines.length, 60);
+});
+
+test("翻到已加载历史边界时继续读取更早的20条消息", async () => {
+  const app = Object.create(QQlightApp.prototype);
+  const chat = { chatType: "private", targetId: "123456" };
+  const chatKey = "private:123456";
+  const makeMessages = (count) => Array.from({ length: count }, (_value, index) => ({
+    id: `message-${index}`,
+    time: index,
+    chatType: "private",
+    targetId: "123456",
+    direction: "incoming",
+    senderName: "对方",
+    text: `消息 ${index}`,
+  }));
+
+  app.config = { maxHistory: 200 };
+  app.activeChat = chat;
+  app.chatRevision = 1;
+  app.chatScrollOffset = 15;
+  app.chatHistoryLoadState = new Map([[
+    chatKey,
+    { loadedCount: 20, hasMore: true, loading: null },
+  ]]);
+  app.historyByChat = new Map([[chatKey, makeMessages(20).slice(0, 20)]]);
+  app.rl = {};
+  app.getChatViewportRows = () => 5;
+  app.getVisibleHistory = () => app.getChatHistory(app.activeChat);
+  app.renderMessage = (message) => message.text;
+  app.redrawChatViewport = () => {};
+  const requestedLimits = [];
+  app.readChatHistory = async (_chat, limit) => {
+    requestedLimits.push(limit);
+    return makeMessages(limit);
+  };
+
+  await app.scrollChatContext(1);
+
+  assert.deepEqual(requestedLimits, [40]);
+  assert.equal(app.getChatHistory(chat).length, 40);
+  assert.equal(app.chatScrollOffset, 20);
+
+  for (let index = 0; index < 6; index += 1) app.scrollChatContext(-1);
+  assert.equal(app.chatScrollOffset, 0);
+});
+
 test("B站 JSON 卡片提取视频标题和分享链接", () => {
   const card = {
     app: "com.tencent.miniapp_01",

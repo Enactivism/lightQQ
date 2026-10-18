@@ -484,6 +484,58 @@ test("消息渲染将昵称和正文明确分层", () => {
   assert.doesNotMatch(line, /小明: 你好/);
 });
 
+test("同一群聊中的不同用户获得不重复的昵称颜色", () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.groupSenderColors = new Map();
+  const messages = [
+    {
+      chatType: "group",
+      targetId: "123456",
+      direction: "incoming",
+      senderId: "10001",
+      senderName: "小明",
+    },
+    {
+      chatType: "group",
+      targetId: "123456",
+      direction: "incoming",
+      senderId: "10002",
+      senderName: "小红",
+    },
+    {
+      chatType: "group",
+      targetId: "123456",
+      direction: "outgoing",
+      senderName: "",
+    },
+  ];
+  const assignedColors = messages.map((message) => app.getGroupSenderColor(message));
+
+  assert.equal(new Set(assignedColors).size, messages.length);
+  assert.equal(app.getGroupSenderColor(messages[0]), assignedColors[0]);
+});
+
+test("聊天头部显示群聊名称和当前时间", () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.connection = { connected: true };
+  const lines = [];
+  app.writeLine = (line) => lines.push(line);
+
+  app.renderChatHeader({
+    chatType: "group",
+    targetId: "123456",
+    displayName: "测试群",
+  });
+
+  assert.match(lines[1], /群聊.*测试群/);
+  assert.match(lines[1], /\b\d{2}:\d{2}:\d{2}\b/);
+  assert.match(lines[2], /群号 123456/);
+  assert.match(lines[2], /在线/);
+  assert.match(lines[0], /^╔═+╗$/);
+  assert.match(lines[3], /^╚═+╝$/);
+  assert.doesNotMatch(lines.join("\n"), /╭─|╰─/);
+});
+
 test("B站 JSON 卡片提取视频标题和分享链接", () => {
   const card = {
     app: "com.tencent.miniapp_01",

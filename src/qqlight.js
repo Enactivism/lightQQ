@@ -60,9 +60,24 @@ const colors = {
   brightMagenta: "\x1b[95m",
 };
 
+// 群聊昵称使用高对比度的 256 色 ANSI 颜色。颜色会在每个群内随机分配，
+// 并从未使用的颜色中选择，避免同一群的不同用户撞色。
+const GROUP_SENDER_COLOR_CODES = [
+  39, 45, 51, 75, 81, 87, 114, 118, 148, 154, 190, 208, 214, 218, 141, 177, 201, 207,
+];
+
 function color(name, value) {
   if (!process.stdout.isTTY) return value;
   return `${colors[name] || ""}${value}${colors.reset}`;
+}
+
+function color256(code, value) {
+  if (!process.stdout.isTTY) return value;
+  return `\u001b[38;5;${code}m${value}${colors.reset}`;
+}
+
+function paintColor(colorRef, value) {
+  return typeof colorRef === "number" ? color256(colorRef, value) : color(colorRef, value);
 }
 
 const ANSI_ESCAPE_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -92,6 +107,26 @@ function terminalCellWidth(value) {
     const codePoint = character.codePointAt(0);
     return width + (isWideTerminalCodePoint(codePoint) ? 2 : 1);
   }, 0);
+}
+
+function truncateTerminalText(value, maxWidth) {
+  const text = String(value || "");
+  if (maxWidth <= 0) return "";
+  if (terminalCellWidth(text) <= maxWidth) return text;
+
+  const suffix = "…";
+  const suffixWidth = terminalCellWidth(suffix);
+  if (maxWidth <= suffixWidth) return suffix.slice(0, maxWidth);
+
+  let result = "";
+  let width = 0;
+  for (const character of text) {
+    const characterWidth = terminalCellWidth(character);
+    if (width + characterWidth + suffixWidth > maxWidth) break;
+    result += character;
+    width += characterWidth;
+  }
+  return `${result}${suffix}`;
 }
 
 function terminalRowCount(value, terminalWidth = process.stdout.columns) {
@@ -953,7 +988,9 @@ class QQlightApp {
     this.config = loadConfig();
     this.historyByChat = new Map();
     this.groupMembersById = new Map();
+    this.groupSenderColors = new Map();
     this.activeChat = null;
+    this.chatHeader = null;
     this.chatRevision = 0;
     this.exiting = false;
     this.runningCommand = false;
@@ -1061,6 +1098,7 @@ class QQlightApp {
     readline.clearLine(process.stdout, 0);
     readline.cursorTo(process.stdout, 0);
     process.stdout.write(`${message}\n`);
+    this.pinChatHeader();
     if (!this.runningCommand && !this.exiting) this.rl.prompt(true);
   }
 
@@ -1427,15 +1465,75 @@ class QQlightApp {
     this.writeLine(color("dim", "[提示] 图片需要从 QQ 图片服务器下载。若本机直连不稳定，可先设置 HTTPS_PROXY（例如 http://127.0.0.1:7890）再重启 QQlight；跨机器部署时还要确认 NapCat 能访问下载链接。"));
   }
 
-  renderChatHeader(chat = this.activeChat) {
-    if (!chat) return;
+  getChatHeaderLines(chat, currentTime = formatTime(Date.now())) {
     const isGroup = chat.chatType === "group";
     const kind = isGroup ? "群聊" : "私聊";
-    const name = chat.displayName || (isGroup ? "未命名群聊" : "对方");
-    const target = `${kind} · ${name}`;
-    const detail = `${chat.targetId}  ·  ${this.connection?.connected ? "在线" : "等待连接"}`;
-    this.writeLine(`${color("brightCyan", "╭─")} ${color("bold", target)}`);
-    this.writeLine(`${color("gray", "╰─")} ${color("dim", detail)}  ${color("gray", "输入 /sc 返回全部消息")}`);
+    const rawName = chat.displayName || (isGroup ? "未命名群聊" : "对方");
+    const terminalWidth = Math.max(40, Number(process.stdout.columns) || 80);
+    const innerWidth = terminalWidth - 2;
+    const timeText = ` ${currentTime} `;
+    const titlePrefix = `  ${kind}  ·  `;
+    const maxNameWidth = Math.max(
+      4,
+      innerWidth - terminalCellWidth(titlePrefix) - terminalCellWidth(timeText) - 3,
+    );
+    const name = truncateTerminalText(rawName, maxNameWidth);
+    const titleWidth = terminalCellWidth(`${titlePrefix}${name}`);
+    const titleGap = Math.max(1, innerWidth - titleWidth - terminalCellWidth(timeText));
+    const status = this.connection?.connected ? "● 在线" : "○ 等待连接";
+    const detailLeft = `  ${isGroup ? "群号" : "QQ号"} ${chat.targetId}`;
+    const detailRight = ` ${status}   ·   输入 /sc 返回全部消息 `;
+    const detailGap = Math.max(
+      1,
+      innerWidth - terminalCellWidth(detailLeft) - terminalCellWidth(detailRight),
+    );
+
+    const padHeaderContent = (content) => (
+      `${content}${" ".repeat(Math.max(0, innerWidth - terminalCellWidth(content)))}${color("brightCyan", "║")}`
+    );
+
+    return [
+      color("brightCyan", `╔${"═".repeat(innerWidth)}╗`),
+      `${color("brightCyan", "║")}${padHeaderContent(
+        `${color("brightCyan", titlePrefix)}${color("bold", name)}${" ".repeat(titleGap)}${color("dim", timeText)}`,
+      )}`,
+      `${color("brightCyan", "║")}${padHeaderContent(
+        `${color("dim", detailLeft)}${" ".repeat(detailGap)}${color("green", detailRight)}`,
+      )}`,
+      color("brightCyan", `╚${"═".repeat(innerWidth)}╝`),
+    ];
+  }
+
+  renderChatHeader(chat = this.activeChat) {
+    if (!chat) return;
+    this.chatHeader = null;
+    const currentTime = formatTime(Date.now());
+    const lines = this.getChatHeaderLines(chat, currentTime);
+    lines.forEach((line) => this.writeLine(line));
+    this.chatHeader = { chat, currentTime, lineCount: lines.length };
+  }
+
+  pinChatHeader() {
+    if (!this.chatHeader || !this.activeChat || !process.stdout.isTTY) return;
+    const lines = this.getChatHeaderLines(
+      this.chatHeader.chat,
+      this.chatHeader.currentTime,
+    );
+    const rendered = lines
+      .map((line, index) => `\u001b[2K${line}${index < lines.length - 1 ? "\n" : ""}`)
+      .join("");
+    process.stdout.write(`\u001b[s\u001b[H${rendered}\u001b[u`);
+  }
+
+  clearChatHeader() {
+    if (process.stdout.isTTY && this.chatHeader) {
+      const lineCount = this.chatHeader.lineCount || 4;
+      const cleared = Array.from({ length: lineCount }, (_, index) => (
+        `\u001b[2K${index < lineCount - 1 ? "\n" : ""}`
+      )).join("");
+      process.stdout.write(`\u001b[s\u001b[H${cleared}\u001b[u`);
+    }
+    this.chatHeader = null;
   }
 
   getPrompt() {
@@ -1838,11 +1936,11 @@ class QQlightApp {
     return recordOrder.slice(-limit).map((key) => recordsByKey.get(key)).filter(Boolean);
   }
 
-  async loadChatHistory(chat, revision) {
+  async loadChatHistory(chat, revision, { display = true } = {}) {
     const chatKey = this.getChatHistoryKey(chat.chatType, chat.targetId);
     await (this.historyWriteQueues.get(chatKey) || Promise.resolve()).catch(() => {});
     const messages = await this.readChatHistory(chat);
-    if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return;
+    if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return [];
     const storedChatName = messages
       .slice()
       .reverse()
@@ -1852,9 +1950,10 @@ class QQlightApp {
       this.updatePrompt();
     }
     messages.forEach((message) => this.addToHistory(message));
-    if (!messages.length) return;
+    if (!display || !messages.length) return messages;
     this.writeLine(color("dim", `已加载最近 ${messages.length} 条本地聊天记录。`));
     messages.forEach((message) => this.writeLine(this.renderMessage(message)));
+    return messages;
   }
 
   async findStoredImageCandidates() {
@@ -1960,6 +2059,33 @@ class QQlightApp {
     return [...this.getChatHistory(this.activeChat)];
   }
 
+  getGroupSenderColor(message) {
+    if (message.chatType !== "group") return null;
+    if (!this.groupSenderColors) this.groupSenderColors = new Map();
+
+    const groupKey = String(message.targetId || "");
+    let senderColors = this.groupSenderColors.get(groupKey);
+    if (!senderColors) {
+      senderColors = new Map();
+      this.groupSenderColors.set(groupKey, senderColors);
+    }
+
+    const senderKey = message.direction === "outgoing"
+      ? "__self__"
+      : String(message.senderId || message.senderName || "__unknown__");
+    if (senderColors.has(senderKey)) return senderColors.get(senderKey);
+
+    const usedColors = new Set(senderColors.values());
+    let availableColors = GROUP_SENDER_COLOR_CODES.filter((code) => !usedColors.has(code));
+    if (!availableColors.length) {
+      availableColors = Array.from({ length: 216 }, (_value, index) => index + 16)
+        .filter((code) => !usedColors.has(code));
+    }
+    const selectedColor = availableColors[crypto.randomInt(availableColors.length)];
+    senderColors.set(senderKey, selectedColor);
+    return selectedColor;
+  }
+
   renderMessage(message) {
     const isOutgoing = message.direction === "outgoing";
     const icon = isOutgoing ? "↑" : "↓";
@@ -1971,7 +2097,10 @@ class QQlightApp {
       ? "我"
       : (message.senderName || (message.chatType === "private" ? "对方" : "群成员"));
     const directionColor = isOutgoing ? "brightMagenta" : "brightCyan";
-    const senderLabel = color(directionColor, color("bold", `【${sender}】`));
+    const senderColor = message.chatType === "group"
+      ? this.getGroupSenderColor(message)
+      : directionColor;
+    const senderLabel = paintColor(senderColor, color("bold", `【${sender}】`));
     const separator = color("gray", " │ ");
     const messageText = String(message.text || "");
     const time = color("dim", formatTime(message.time));
@@ -1983,7 +2112,7 @@ class QQlightApp {
       const status = isOutgoing
         ? color(deliveryStatus === "failed" ? "red" : "green", deliveryStatus === "failed" ? "!" : "✓")
         : color(directionColor, "•");
-      const senderText = color(directionColor, color("bold", sender));
+      const senderText = paintColor(senderColor, color("bold", sender));
       const messageLines = messageText.split(/\r?\n/);
       const bubble = [
         `${color(directionColor, "╭─")} ${senderText}  ${time}  ${status}`,
@@ -2122,6 +2251,7 @@ class QQlightApp {
     const visibleHistory = this.getVisibleHistory();
     const count = countText ? Math.max(1, Math.min(visibleHistory.length, Number(countText) || 20)) : 20;
     const items = visibleHistory.slice(-count);
+    this.renderChatHeader(this.activeChat);
     if (!items.length) {
       this.writeLine(color("dim", this.activeChat ? "当前会话没有消息历史。" : "当前没有消息历史。"));
       return;
@@ -2131,6 +2261,7 @@ class QQlightApp {
 
   async selectChat(command) {
     if (/^sc$/i.test(command)) {
+      this.clearChatHeader();
       this.activeChat = null;
       this.chatRevision += 1;
       this.updatePrompt();
@@ -2154,16 +2285,26 @@ class QQlightApp {
       return;
     }
     const revision = ++this.chatRevision;
+    this.clearChatHeader();
     this.activeChat = chat;
     this.updatePrompt();
-    this.renderChatHeader(chat);
+    let messages = [];
     try {
-      await this.loadChatHistory(chat, revision);
+      messages = await this.loadChatHistory(chat, revision, { display: false });
     } catch (error) {
       this.writeLine(color("red", `[错误] 本地聊天记录加载失败：${error.message}`));
     }
+
+    if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return;
+    if (chat.chatType === "group" && !chat.displayName) await this.loadGroupName(chat, revision);
+    if (revision !== this.chatRevision || !messageMatchesChat(this.activeChat, chat)) return;
+
+    this.renderChatHeader(chat);
+    if (messages.length) {
+      this.writeLine(color("dim", `已加载最近 ${messages.length} 条本地聊天记录。`));
+      messages.forEach((message) => this.writeLine(this.renderMessage(message)));
+    }
     if (chat.chatType === "private") this.loadPrivateNickname(chat, revision);
-    else this.loadGroupName(chat, revision);
   }
 
   async loadPrivateNickname(chat, revision) {

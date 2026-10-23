@@ -51,6 +51,8 @@ private/
 
 # Local application state and private user data
 .qqlight/
+sync-state.json
+sync-state.json.*
 chat-history/
 data/
 runtime/
@@ -98,6 +100,11 @@ pnpm-debug.log*
 
 # Temporary clipboard and exported files
 qqlight-clipboard-*
+qqlight-test-*/
+qqlight-sync-test-*/
+qqlight-store-test-*/
+qqlight-live-sync-*/
+qqlight-terminal-test-*/
 exports/
 export/
 *.tmp

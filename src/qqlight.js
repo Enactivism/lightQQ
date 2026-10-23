@@ -11,6 +11,8 @@ const tls = require("node:tls");
 const { spawn } = require("node:child_process");
 const { fileURLToPath } = require("node:url");
 const WebSocket = require("ws");
+const { HistoryStore, compareMessages, mergeRecord } = require("./history-store");
+const { HistorySync, SYNC_DEFAULTS } = require("./history-sync");
 
 const IMAGE_PLACEHOLDER = "{图片}";
 const BRACKETED_PASTE_START = "\u001b[200~";
@@ -40,6 +42,8 @@ const DEFAULT_CONFIG = {
   privateIds: [],
   groupIds: [],
   maxHistory: 200,
+  syncPageSize: SYNC_DEFAULTS.pageSize,
+  syncConcurrency: SYNC_DEFAULTS.concurrency,
 };
 
 const CONFIG_PATH = process.env.QQLIGHT_CONFIG
@@ -49,23 +53,49 @@ const CONFIG_PATH = process.env.QQLIGHT_CONFIG
 const colors = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
-  dim: "\x1b[2m",
-  gray: "\x1b[90m",
-  blue: "\x1b[34m",
-  brightBlue: "\x1b[94m",
-  cyan: "\x1b[36m",
-  brightCyan: "\x1b[96m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  red: "\x1b[31m",
-  magenta: "\x1b[35m",
-  brightMagenta: "\x1b[95m",
+  dim: "\x1b[2;38;5;145m",
+  gray: "\x1b[38;5;244m",
+  blue: "\x1b[38;5;39m",
+  brightBlue: "\x1b[38;5;81m",
+  cyan: "\x1b[38;5;51m",
+  brightCyan: "\x1b[38;5;87m",
+  green: "\x1b[38;5;118m",
+  yellow: "\x1b[38;5;226m",
+  red: "\x1b[38;5;203m",
+  magenta: "\x1b[38;5;165m",
+  brightMagenta: "\x1b[38;5;201m",
 };
+
+// QQlight 的默认主题：霓虹粉和电子青负责聊天方向，酸性黄绿负责状态，
+// 紫罗兰、橙色和薰衣草色用来打散信息层级。全部使用 256 色，在现代终端里
+// 比传统 8 色更有饱和度，同时保留亮色正文保证长时间阅读不会糊成一团。
+const NEON_THEME = Object.freeze({
+  pink: 201,
+  cyan: 51,
+  sky: 81,
+  yellow: 226,
+  lime: 154,
+  orange: 208,
+  violet: 141,
+  purple: 165,
+  coral: 203,
+  lavender: 183,
+  white: 255,
+});
+
+const NEON_RAINBOW = Object.freeze([
+  NEON_THEME.pink,
+  NEON_THEME.cyan,
+  NEON_THEME.yellow,
+  NEON_THEME.lime,
+  NEON_THEME.orange,
+  NEON_THEME.violet,
+]);
 
 // 群聊昵称使用高对比度的 256 色 ANSI 颜色。颜色会在每个群内随机分配，
 // 并从未使用的颜色中选择，避免同一群的不同用户撞色。
 const GROUP_SENDER_COLOR_CODES = [
-  39, 45, 51, 75, 81, 87, 114, 118, 148, 154, 190, 208, 214, 218, 141, 177, 201, 207,
+  45, 51, 75, 81, 87, 118, 141, 154, 165, 177, 190, 201, 207, 208, 213, 214, 218, 225,
 ];
 
 function color(name, value) {
@@ -76,6 +106,25 @@ function color(name, value) {
 function color256(code, value) {
   if (!process.stdout.isTTY) return value;
   return `\u001b[38;5;${code}m${value}${colors.reset}`;
+}
+
+function neonColor(name, value) {
+  const code = NEON_THEME[name];
+  return typeof code === "number" ? color256(code, value) : String(value);
+}
+
+function neonCycle(value, palette = NEON_RAINBOW) {
+  const text = String(value);
+  if (!process.stdout.isTTY) return text;
+  const codes = palette.filter((code) => Number.isInteger(code));
+  if (!codes.length) return text;
+  return [...text]
+    .map((character, index) => color256(codes[index % codes.length], character))
+    .join("");
+}
+
+function neonBold(name, value) {
+  return color("bold", neonColor(name, value));
 }
 
 function paintColor(colorRef, value) {
@@ -431,6 +480,8 @@ function loadConfig() {
   config.privateIds = normalizeIds(config.privateIds);
   config.groupIds = normalizeIds(config.groupIds);
   config.maxHistory = Math.max(20, Math.min(2000, Number(config.maxHistory) || DEFAULT_CONFIG.maxHistory));
+  config.syncPageSize = Math.max(2, Math.min(100, Math.floor(Number(config.syncPageSize) || DEFAULT_CONFIG.syncPageSize)));
+  config.syncConcurrency = Math.max(1, Math.min(4, Math.floor(Number(config.syncConcurrency) || DEFAULT_CONFIG.syncConcurrency)));
   return config;
 }
 
@@ -444,6 +495,8 @@ function saveConfig(config) {
       privateIds: config.privateIds,
       groupIds: config.groupIds,
       maxHistory: config.maxHistory,
+      syncPageSize: config.syncPageSize,
+      syncConcurrency: config.syncConcurrency,
     }, null, 2)}\n`,
     "utf8",
   );
@@ -769,12 +822,21 @@ function normalizeChatName(value) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, 80);
 }
 
-function createMessageEvent(payload) {
+function createMessageEvent(payload, { chat = null, selfId = "", historical = false } = {}) {
   if (!payload || !["message", "message_sent"].includes(payload.post_type)) return null;
   if (!["private", "group"].includes(payload.message_type)) return null;
 
   const chatType = payload.message_type;
-  const targetId = chatType === "private" ? String(payload.user_id || "") : String(payload.group_id || "");
+  if (chat && chat.chatType !== chatType) throw new Error("历史消息类型与查询会话不一致");
+  const accountId = String(payload.self_id || selfId || "");
+  if (selfId && payload.self_id && String(payload.self_id) !== String(selfId)) {
+    throw new Error("历史消息账号与当前登录账号不一致");
+  }
+  const targetId = chat ? String(chat.targetId)
+    : chatType === "private" ? String(payload.target_id || payload.user_id || "") : String(payload.group_id || "");
+  if (chatType === "group" && chat && payload.group_id && String(payload.group_id) !== targetId) {
+    throw new Error("历史消息群号与查询会话不一致");
+  }
   if (!/^\d+$/.test(targetId)) return null;
 
   const sender = payload.sender && typeof payload.sender === "object" ? payload.sender : {};
@@ -782,11 +844,21 @@ function createMessageEvent(payload) {
   const messageContent = payload.message ?? payload.raw_message ?? "";
   const text = extractMessageText(messageContent);
   if (!text) return null;
+  const receivedAt = Date.now();
+  const originalTime = Number(payload.time);
+  const serverTime = Number.isFinite(originalTime) && originalTime > 0;
+  const outgoing = payload.post_type === "message_sent" || Boolean(accountId && senderId === accountId);
 
   return {
     id: String(payload.message_id || `${Date.now()}-${Math.random()}`),
-    time: Date.now(),
-    direction: payload.post_type === "message_sent" ? "outgoing" : "incoming",
+    time: serverTime ? (originalTime < 100000000000 ? originalTime * 1000 : originalTime) : receivedAt,
+    receivedAt,
+    serverTime,
+    selfId: accountId,
+    realSeq: String(payload.real_seq || ""),
+    historyOrder: receivedAt * 1000,
+    source: historical ? "history" : "live",
+    direction: outgoing ? "outgoing" : "incoming",
     chatType,
     targetId,
     chatName: chatType === "group" ? normalizeChatName(payload.group_name) : "",
@@ -879,7 +951,7 @@ class NapCatConnection {
       this.onLog("已连接 NapCat OneBot 11 WebSocket");
     });
 
-    socket.on("message", (raw) => this.handlePacket(raw));
+    socket.on("message", (raw) => { if (socket === this.socket) this.handlePacket(raw); });
     socket.on("error", (error) => {
       if (socket === this.socket) this.onLog(`WebSocket 错误：${error.message}`);
     });
@@ -913,6 +985,11 @@ class NapCatConnection {
       this.socket.close();
       this.socket = null;
     }
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("NapCat WebSocket 正在重连"));
+    }
+    this.pending.clear();
     this.state = "disconnected";
     this.connect();
   }
@@ -954,7 +1031,10 @@ class NapCatConnection {
       if (packet.status === "ok" && Number(packet.retcode) === 0) {
         pending.resolve(packet);
       } else {
-        pending.reject(new Error(packet.wording || `NapCat 返回 retcode=${packet.retcode}`));
+        pending.reject(Object.assign(
+          new Error(packet.wording || `NapCat 返回 retcode=${packet.retcode}`),
+          { retcode: Number(packet.retcode) },
+        ));
       }
       return;
     }
@@ -986,8 +1066,8 @@ class NapCatConnection {
 }
 
 class QQlightApp {
-  constructor() {
-    this.config = loadConfig();
+  constructor(config = null) {
+    this.config = config ? { ...DEFAULT_CONFIG, ...config } : loadConfig();
     this.historyByChat = new Map();
     this.groupMembersById = new Map();
     this.groupSenderColors = new Map();
@@ -1014,19 +1094,36 @@ class QQlightApp {
     this.imageDir = IMAGE_DIR;
     this.lastImagePath = null;
     this.historyWriteQueues = new Map();
-    this.persistedMessageKeys = new Map();
+    this.historyStore = null;
+    this.historySync = null;
+    this.selfId = "";
+    this.legacyAccountId = "";
+    this.accountReady = Promise.resolve();
+    this.queuedImageKeys = new Set();
     this.messageQueue = Promise.resolve();
     this.imageSaveQueue = Promise.resolve();
     this.imageDownloadHintShown = false;
+    this.imageFetchControllers = new Set();
     this.fetchImpl = globalThis.fetch;
     this.waitImpl = wait;
     this.rl = null;
     this.connection = new NapCatConnection(this.config, {
       onStatus: (status, detail) => {
         if (detail) this.writeLine(color(status.state === "open" ? "green" : "yellow", `[状态] ${detail}`));
+        if (!this.historySync) return;
+        if (status.state === "open") {
+          this.accountReady = this.historySync.startSession();
+          this.accountReady.catch((error) => {
+            this.writeLine(color("red", `[同步] 登录账号确认失败：${error.message}；输入 reconnect 重试。`));
+          });
+        } else {
+          this.historySync.disconnect();
+        }
       },
       onMessage: (message) => {
+        const accountReady = this.accountReady;
         this.messageQueue = this.messageQueue
+          .then(() => accountReady)
           .then(() => this.receiveMessage(message))
           .catch((error) => this.writeLine(color("red", `[错误] 消息处理失败：${error.message}`)));
       },
@@ -1098,14 +1195,104 @@ class QQlightApp {
     process.on("SIGINT", this.sigintHandler);
     this.setBracketedPaste(true);
     this.rl.prompt();
-    this.connection.start();
+    this.initializeHistorySync()
+      .then(() => { if (!this.exiting) this.connection.start(); })
+      .catch((error) => this.writeLine(color("red", `[错误] 本地历史初始化失败：${error.message}；修复后重新启动。`)));
+  }
+
+  getHistoryStore() {
+    if (!this.historyStore) {
+      this.historyStore = new HistoryStore({
+        historyDir: this.historyDir,
+        serialize: (message) => this.serializeHistoryMessage(message),
+      });
+      this.historyStore.setAccount(this.selfId, this.legacyAccountId);
+      this.historyWriteQueues = this.historyStore.writeQueues;
+    }
+    return this.historyStore;
+  }
+
+  getWhitelistChats() {
+    const chats = [
+      ...this.config.privateIds.map((targetId) => ({ chatType: "private", targetId })),
+      ...this.config.groupIds.map((targetId) => ({ chatType: "group", targetId })),
+    ];
+    return chats.sort((left, right) => Number(messageMatchesChat(right, this.activeChat))
+      - Number(messageMatchesChat(left, this.activeChat)));
+  }
+
+  async initializeHistorySync() {
+    this.historySync = new HistorySync({
+      connection: this.connection,
+      statePath: path.join(path.dirname(this.historyDir), "sync-state.json"),
+      getChats: () => this.getWhitelistChats(),
+      captureAnchors: (chat) => this.getHistoryStore().captureAnchors(chat),
+      onIdentity: async (selfId, legacyAccountId) => {
+        if (this.selfId && this.selfId !== selfId) this.historyByChat.clear();
+        this.selfId = selfId;
+        this.legacyAccountId = legacyAccountId;
+        this.getHistoryStore().setAccount(selfId, legacyAccountId);
+        // Build the disk index before buffered live events enter the message queue.
+        for (const chat of this.getWhitelistChats()) await this.getHistoryStore().ensureIndex(chat);
+      },
+      applyPage: (chat, page, selfId) => this.applyHistoryPage(chat, page, selfId),
+      onEvent: (event) => this.handleSyncEvent(event),
+      options: { pageSize: this.config.syncPageSize, concurrency: this.config.syncConcurrency },
+    });
+    await this.historySync.prepare();
+  }
+
+  applyHistoryPage(chat, page, selfId) {
+    const task = this.messageQueue.catch(() => {}).then(async () => {
+      if (this.selfId !== selfId || !this.historySync?.allowed(chat)) throw new Error("同步会话已失效");
+      const index = await this.getHistoryStore().ensureIndex(chat);
+      const messages = page.map((payload) => createMessageEvent({
+        ...payload, post_type: payload.post_type || "message", message_type: payload.message_type || chat.chatType,
+      }, { chat, selfId, historical: true })).filter(Boolean);
+      const anchorIndex = messages.findIndex((message) => Number.isFinite(index.get(message.id)?.historyOrder));
+      const baseOrder = anchorIndex >= 0 ? index.get(messages[anchorIndex].id).historyOrder - anchorIndex : Date.now() * 1000;
+      let added = 0;
+      let changed = false;
+      for (const [position, message] of messages.entries()) {
+        if (!this.historySync.allowed(chat) || this.selfId !== selfId) throw new Error("同步会话已失效");
+        message.historyOrder = baseOrder + position;
+        const result = await this.receiveMessage(message, { historical: true });
+        added += Number(Boolean(result?.added));
+        changed ||= Boolean(result?.changed);
+      }
+      return { added, changed };
+    });
+    this.messageQueue = task.catch(() => {});
+    return task;
+  }
+
+  handleSyncEvent(event) {
+    if (this.exiting || event.type === "progress") return;
+    if (event.type === "start") {
+      this.writeLine(color("dim", `[同步] 开始同步 ${event.count} 个白名单聊天。`));
+      return;
+    }
+    if (event.type === "warning") {
+      this.writeLine(color("yellow", `[同步] ${event.message}`));
+      return;
+    }
+    const label = event.chat?.chatType === "group" ? "群聊" : "私聊";
+    const scope = `${label} ${event.chat?.targetId || ""}`;
+    if (event.type === "partial") {
+      this.writeLine(color("yellow", `[同步] ${scope} 未完成：${event.message}；可输入 sync 重试。`));
+    } else if (event.type === "complete") {
+      this.writeLine(color("dim", `[同步] ${scope} 完成，补回 ${event.added} 条消息。`));
+    }
+    if (event.changed && this.activeChat && messageMatchesChat(event.chat, this.activeChat)) {
+      if (process.stdout.isTTY) this.redrawChatViewport();
+    }
   }
 
   printBanner() {
-    console.log(color("cyan", "QQlight 0.1.0 — NapCat 终端客户端"));
-    console.log(color("dim", `配置文件：${CONFIG_PATH}`));
-    console.log(color("dim", "输入 help 查看命令；只有白名单中的私聊和群聊消息会被接收。"));
-    console.log(color("yellow", "提示：按 Ctrl+D 退出程序"));
+    console.log(`${neonCycle("QQlight")} ${neonBold("lavender", "0.1.0")} ${color("dim", "— NapCat 终端客户端")}`);
+    console.log(`${neonColor("violet", "◆")} ${color("dim", `配置文件：${CONFIG_PATH}`)}`);
+    console.log(`${neonColor("cyan", "✦")} ${color("dim", "输入 help 查看命令；只有白名单中的私聊和群聊消息会被接收。")}`);
+    console.log(`${neonColor("yellow", "⚡")} ${color("dim", "提示：按")} ${neonColor("pink", "Ctrl+D")} ${color("dim", "退出程序")}`);
   }
 
   writeLine(message) {
@@ -1240,19 +1427,29 @@ class QQlightApp {
     this.writeLine(this.renderMessage(message));
   }
 
-  async receiveMessage(message) {
-    if (this.getHistoryMessage(message) || this.isRecentOutgoingImageDuplicate(message)) return;
-    const needsImageSave = Boolean(message.imageSources?.length);
+  async receiveMessage(message, { historical = false } = {}) {
+    if (this.selfId && message.selfId && message.selfId !== this.selfId) throw new Error("消息账号与当前登录账号不一致");
+    if (!historical && this.isRecentOutgoingImageDuplicate(message)) return { added: false, changed: false };
+    const store = this.getHistoryStore();
+    const index = await store.ensureIndex(message);
+    const previous = index.get(String(message.id));
+    const existing = this.getHistoryMessage(message);
+    const merged = mergeRecord(previous, mergeRecord(existing, message));
+    delete merged.hash;
+    merged.imagePaths = (merged.imagePaths || []).map((imagePath) => this.resolveStoredImagePath(imagePath))
+      .filter((imagePath) => imagePath && fs.existsSync(imagePath));
+    const needsImageSave = Boolean(merged.imageSources?.length) && !merged.imagePaths?.length;
     // 图片要从 QQ 图片服务器下载，慢的时候一条消息可能卡住几十秒。
     // 先把消息显示出来，图片在后台保存，避免整个聊天界面被一张图片拖住。
-    const historyMessage = needsImageSave ? { ...message, imagePaths: [] } : message;
-    if (!this.addToHistory(historyMessage)) return;
-    this.persistMessage(historyMessage).catch((error) => {
-      this.writeLine(color("red", `[错误] 聊天记录保存失败：${error.message}`));
-    });
+    const historyMessage = needsImageSave
+      ? { ...merged, imagePaths: [], imageState: "pending" }
+      : merged;
+    if (existing) Object.assign(existing, historyMessage);
+    this.addToHistory(existing || historyMessage);
     if (this.activeChat?.chatType === "private"
       && historyMessage.chatType === "private"
       && historyMessage.targetId === this.activeChat.targetId
+      && historyMessage.direction !== "outgoing"
       && historyMessage.senderName) {
       this.activeChat.displayName = historyMessage.senderName;
       this.updatePrompt();
@@ -1264,37 +1461,44 @@ class QQlightApp {
       this.activeChat.displayName = historyMessage.chatName;
       this.updatePrompt();
     }
-    if (messageMatchesChat(historyMessage, this.activeChat)) {
+    if (!historical && !previous && !existing && messageMatchesChat(historyMessage, this.activeChat)) {
       this.displayActiveMessage(historyMessage);
     }
-    if (needsImageSave) this.scheduleImageSave(historyMessage);
+    const result = await this.persistMessage(historyMessage);
+    if (needsImageSave) this.scheduleImageSave(existing || historyMessage);
+    return result;
   }
 
   // 图片保存在独立队列里执行：即使一张图片失败或超时，也不会阻塞后续消息。
   scheduleImageSave(message) {
+    const key = messageKey(message);
+    if (this.queuedImageKeys?.has(key)) return this.imageSaveQueue;
+    this.queuedImageKeys?.add(key);
     this.imageSaveQueue = this.imageSaveQueue
-      .then(() => this.saveMessageImages(message))
-      .then((stored) => this.applySavedImages(message, stored))
+      .then(() => this.exiting || (message.selfId && this.selfId && message.selfId !== this.selfId)
+        ? null : this.saveMessageImages(message))
+      .then((stored) => stored ? this.applySavedImages(message, stored) : undefined)
       .catch((error) => {
         this.writeLine(color("red", `[错误] 图片保存失败：${formatImageError(error)}`));
         if (error?.kind === "download") this.printImageDownloadHint();
-      });
+      })
+      .finally(() => this.queuedImageKeys?.delete(key));
     return this.imageSaveQueue;
   }
 
   async applySavedImages(message, stored) {
     const imagePaths = Array.isArray(stored?.imagePaths) ? stored.imagePaths : [];
-    if (!imagePaths.length) return;
     message.imagePaths = imagePaths;
+    message.imageState = imagePaths.length ? "saved" : "failed";
+    const current = this.getHistoryMessage(message);
+    if (current) {
+      current.imagePaths = imagePaths;
+      current.imageState = message.imageState;
+    }
     await this.persistMessageImages(message);
   }
 
   async persistMessageImages(message) {
-    const chatKey = this.getChatHistoryKey(message.chatType, message.targetId);
-    await (this.historyWriteQueues.get(chatKey) || Promise.resolve()).catch(() => {});
-    const persistedKeys = this.persistedMessageKeys.get(chatKey);
-    // 先补存图片路径，再写一遍同一条记录；读取时按 id 合并，后写入的 imagePaths 生效。
-    if (persistedKeys) persistedKeys.delete(messageKey(message));
     await this.persistMessage(message);
   }
 
@@ -1351,6 +1555,7 @@ class QQlightApp {
 
     for (let attempt = 0; attempt < IMAGE_FETCH_ATTEMPTS; attempt += 1) {
       const controller = new AbortController();
+      this.imageFetchControllers?.add(controller);
       const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
       try {
         const response = await this.requestImage(source, controller.signal);
@@ -1400,8 +1605,10 @@ class QQlightApp {
         }
       } finally {
         clearTimeout(timer);
+        this.imageFetchControllers?.delete(controller);
       }
 
+      if (this.exiting) throw lastError;
       if (!lastError.retryable || attempt >= IMAGE_FETCH_ATTEMPTS - 1) break;
       const delay = IMAGE_FETCH_RETRY_DELAYS_MS[attempt] || 0;
       if (delay) await waitImpl(delay);
@@ -1601,27 +1808,36 @@ class QQlightApp {
     const name = truncateTerminalText(rawName, maxNameWidth);
     const titleWidth = terminalCellWidth(`${titlePrefix}${name}`);
     const titleGap = Math.max(1, innerWidth - titleWidth - terminalCellWidth(timeText));
-    const status = this.connection?.connected ? "● 在线" : "○ 等待连接";
-    const detailLeft = `  ${isGroup ? "群号" : "QQ号"} ${chat.targetId}`;
-    const detailRight = ` ${status}   ·   输入 /sc 返回全部消息 `;
+    const status = this.connection?.connected
+      ? neonColor("lime", "● 在线")
+      : neonColor("yellow", "○ 等待连接");
+    const detailLeft = neonColor("lavender", `  ${isGroup ? "群号" : "QQ号"} ${chat.targetId}`);
+    const detailRight = ` ${status}   ${neonColor("orange", "·")}   ${neonColor("cyan", "输入 /sc 返回全部消息")} `;
     const detailGap = Math.max(
       1,
       innerWidth - terminalCellWidth(detailLeft) - terminalCellWidth(detailRight),
     );
 
+    const side = neonColor("cyan", "║");
+    const border = (value) => neonCycle(value, [
+      NEON_THEME.cyan,
+      NEON_THEME.pink,
+      NEON_THEME.violet,
+      NEON_THEME.cyan,
+    ]);
     const padHeaderContent = (content) => (
-      `${content}${" ".repeat(Math.max(0, innerWidth - terminalCellWidth(content)))}${color("brightCyan", "║")}`
+      `${content}${" ".repeat(Math.max(0, innerWidth - terminalCellWidth(content)))}${side}`
     );
 
     return [
-      color("brightCyan", `╔${"═".repeat(innerWidth)}╗`),
-      `${color("brightCyan", "║")}${padHeaderContent(
-        `${color("brightCyan", titlePrefix)}${color("bold", name)}${" ".repeat(titleGap)}${color("dim", timeText)}`,
+      border(`╔${"═".repeat(innerWidth)}╗`),
+      `${side}${padHeaderContent(
+        `${neonColor("pink", titlePrefix)}${neonBold("yellow", name)}${" ".repeat(titleGap)}${neonColor("lavender", timeText)}`,
       )}`,
-      `${color("brightCyan", "║")}${padHeaderContent(
-        `${color("dim", detailLeft)}${" ".repeat(detailGap)}${color("green", detailRight)}`,
+      `${side}${padHeaderContent(
+        `${detailLeft}${" ".repeat(detailGap)}${detailRight}`,
       )}`,
-      color("brightCyan", `╚${"═".repeat(innerWidth)}╝`),
+      border(`╚${"═".repeat(innerWidth)}╝`),
     ];
   }
 
@@ -1659,7 +1875,7 @@ class QQlightApp {
   }
 
   getPrompt() {
-    return this.activeChat ? "› " : "> ";
+    return neonColor(this.activeChat ? "pink" : "cyan", this.activeChat ? "› " : "> ");
   }
 
   updatePrompt() {
@@ -1893,9 +2109,12 @@ class QQlightApp {
     const key = messageKey(message);
     const existingIndex = history.findIndex((item) => messageKey(item) === key);
     if (existingIndex >= 0) {
+      history[existingIndex] = mergeRecord(history[existingIndex], message);
+      history.sort(compareMessages);
       return false;
     }
     history.push(message);
+    history.sort(compareMessages);
     while (history.length > this.config.maxHistory) history.shift();
     return true;
   }
@@ -1934,16 +2153,12 @@ class QQlightApp {
         recordsByKey.set(key, message);
         return;
       }
-      recordsByKey.set(key, {
-        ...previous,
-        ...message,
-        imagePaths: message.imagePaths?.length ? message.imagePaths : previous.imagePaths,
-      });
+      recordsByKey.set(key, mergeRecord(previous, message));
     });
 
     const maxHistory = Math.max(20, Math.min(2000, Number(this.config?.maxHistory) || DEFAULT_CONFIG.maxHistory));
     const merged = [...recordsByKey.values()]
-      .sort((left, right) => (Number(left.time) || 0) - (Number(right.time) || 0))
+      .sort(compareMessages)
       .slice(-maxHistory);
     this.historyByChat.set(chatKey, merged);
     return merged;
@@ -1974,12 +2189,18 @@ class QQlightApp {
   serializeHistoryMessage(message) {
     const imageRoot = path.resolve(this.imageDir);
     const imagePaths = (Array.isArray(message.imagePaths) ? message.imagePaths : [])
-      .map((imagePath) => path.resolve(String(imagePath)))
+      .map((imagePath) => path.resolve(this.projectDir, String(imagePath)))
       .filter((imagePath) => imagePath.startsWith(`${imageRoot}${path.sep}`))
       .map((imagePath) => path.relative(this.projectDir, imagePath));
     return {
       id: String(message.id),
       time: message.time,
+      receivedAt: message.receivedAt || message.time,
+      serverTime: Boolean(message.serverTime),
+      realSeq: String(message.realSeq || ""),
+      historyOrder: Number.isFinite(message.historyOrder) ? message.historyOrder : undefined,
+      selfId: String(message.selfId || this.selfId || ""),
+      source: message.source || "local",
       direction: message.direction,
       deliveryStatus: message.direction === "outgoing"
         ? (message.deliveryStatus === "failed" ? "failed" : "success")
@@ -1991,6 +2212,10 @@ class QQlightApp {
       senderName: String(message.senderName || ""),
       text: String(message.text || ""),
       imagePaths,
+      imageState: imagePaths.length ? "saved" : message.imageState || "",
+      imageSources: imagePaths.length ? [] : (message.imageSources || [])
+        .filter((source) => !/^(?:base64|data):/i.test(String(source.file || "")))
+        .map((source) => ({ file: String(source.file || ""), url: String(source.url || ""), type: String(source.type || "") })),
     };
   }
 
@@ -2003,99 +2228,18 @@ class QQlightApp {
   }
 
   persistMessage(message) {
-    const filePath = this.getHistoryFilePath(message.chatType, message.targetId);
-    const record = `${JSON.stringify(this.serializeHistoryMessage(message))}\n`;
-    const chatKey = this.getChatHistoryKey(message.chatType, message.targetId);
-    const previousTask = this.historyWriteQueues.get(chatKey) || Promise.resolve();
-    const task = previousTask
-      .catch(() => {})
-      .then(async () => {
-        let persistedKeys = this.persistedMessageKeys.get(chatKey);
-        if (!persistedKeys) {
-          persistedKeys = new Set();
-          try {
-            const existing = await fs.promises.readFile(filePath, "utf8");
-            existing.split(/\r?\n/).forEach((line) => {
-              if (!line.trim()) return;
-              try {
-                const stored = JSON.parse(line);
-                if (stored && stored.id) persistedKeys.add(messageKey(stored));
-              } catch {
-                // 忽略损坏的旧记录，保留后续可用记录。
-              }
-            });
-          } catch (error) {
-            if (error.code !== "ENOENT") throw error;
-          }
-          this.persistedMessageKeys.set(chatKey, persistedKeys);
-        }
-        const key = messageKey(message);
-        if (persistedKeys.has(key)) return;
-        await fs.promises.mkdir(this.historyDir, { recursive: true, mode: 0o700 });
-        await fs.promises.appendFile(filePath, record, { encoding: "utf8", mode: 0o600 });
-        await fs.promises.chmod(filePath, 0o600);
-        persistedKeys.add(key);
-      });
-    this.historyWriteQueues.set(chatKey, task);
-    return task;
+    return this.getHistoryStore().upsert(message);
   }
 
   async readChatHistory(chat, limit = HISTORY_LOAD_LIMIT) {
-    const filePath = this.getHistoryFilePath(chat.chatType, chat.targetId);
-    const stream = fs.createReadStream(filePath, { encoding: "utf8" });
-    const input = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    const recordsByKey = new Map();
-    const recordOrder = [];
-
-    try {
-      for await (const line of input) {
-        if (!line.trim()) continue;
-        try {
-          const record = JSON.parse(line);
-          if (!record || !["incoming", "outgoing"].includes(record.direction)) continue;
-          if (record.chatType !== chat.chatType || String(record.targetId) !== chat.targetId) continue;
-          if (!record.id || typeof record.text !== "string") continue;
-          const stored = {
-            id: String(record.id),
-            time: record.time || Date.now(),
-            direction: record.direction,
-            deliveryStatus: record.direction === "outgoing" && record.deliveryStatus === "failed"
-              ? "failed"
-              : record.direction === "outgoing" ? "success" : "",
-            chatType: record.chatType,
-            targetId: chat.targetId,
-            chatName: record.chatType === "group" ? normalizeChatName(record.chatName) : "",
-            senderId: String(record.senderId || ""),
-            senderName: String(record.senderName || ""),
-            text: record.text,
-            rawMessage: record.text,
-            imagePaths: Array.isArray(record.imagePaths)
-              ? record.imagePaths.map((imagePath) => this.resolveStoredImagePath(imagePath)).filter(Boolean)
-              : [],
-            historySource: "persisted",
-          };
-          const key = messageKey(stored);
-          const previous = recordsByKey.get(key);
-          if (!previous) {
-            recordsByKey.set(key, stored);
-            recordOrder.push(key);
-          } else {
-            recordsByKey.set(key, {
-              ...previous,
-              ...stored,
-              imagePaths: stored.imagePaths.length ? stored.imagePaths : previous.imagePaths,
-            });
-          }
-        } catch {
-          // 忽略损坏的旧记录，继续加载其他聊天记录。
-        }
-      }
-    } catch (error) {
-      if (error.code === "ENOENT") return [];
-      throw error;
-    }
-
-    return recordOrder.slice(-limit).map((key) => recordsByKey.get(key)).filter(Boolean);
+    const records = await this.getHistoryStore().read(chat, limit);
+    return records.map((record) => ({
+      ...record,
+      deliveryStatus: record.direction === "outgoing" ? record.deliveryStatus || "success" : "",
+      rawMessage: record.text,
+      imagePaths: (record.imagePaths || []).map((imagePath) => this.resolveStoredImagePath(imagePath)).filter(Boolean),
+      historySource: "persisted",
+    }));
   }
 
   async loadChatHistory(chat, revision, { display = true } = {}) {
@@ -2118,6 +2262,11 @@ class QQlightApp {
       this.updatePrompt();
     }
     this.mergeLoadedChatHistory(chat, messages);
+    if (this.connection.connected) {
+      for (const message of messages) {
+        if (message.imageSources?.length && !message.imagePaths?.length) this.scheduleImageSave(message);
+      }
+    }
     state.loadedCount = messages.length;
     state.hasMore = messages.length >= loadLimit && messages.length < maxHistory;
     state.loading = null;
@@ -2309,32 +2458,33 @@ class QQlightApp {
     const sender = isOutgoing
       ? "我"
       : (message.senderName || (message.chatType === "private" ? "对方" : "群成员"));
-    const directionColor = isOutgoing ? "brightMagenta" : "brightCyan";
+    const directionColor = isOutgoing ? "pink" : "cyan";
     const senderColor = message.chatType === "group"
       ? this.getGroupSenderColor(message)
-      : directionColor;
+      : NEON_THEME[directionColor];
     const senderLabel = paintColor(senderColor, color("bold", `【${sender}】`));
-    const separator = color("gray", " │ ");
+    const separator = neonColor("purple", " │ ");
     const messageText = String(message.text || "");
-    const time = color("dim", formatTime(message.time));
+    const time = neonColor("lavender", formatTime(message.time));
+    const bodyText = neonColor("white", messageText);
     const isIsolatedMessage = this.activeChat
       && messageMatchesChat(message, this.activeChat)
       && process.stdout.isTTY;
     if (isIsolatedMessage) {
       const deliveryStatus = message.deliveryStatus === "failed" ? "failed" : "success";
       const status = isOutgoing
-        ? color(deliveryStatus === "failed" ? "red" : "green", deliveryStatus === "failed" ? "!" : "✓")
-        : color(directionColor, "•");
+        ? neonColor(deliveryStatus === "failed" ? "coral" : "lime", deliveryStatus === "failed" ? "!" : "✓")
+        : neonColor(directionColor, "•");
       const senderText = paintColor(senderColor, color("bold", sender));
       const messageLines = messageText.split(/\r?\n/);
       const bubble = [
-        `${color(directionColor, "╭─")} ${senderText}  ${time}  ${status}`,
-        `${color(directionColor, "╰─")} ${messageLines[0] || ""}`,
-        ...messageLines.slice(1).map((line) => `   ${line}`),
+        `${neonColor(directionColor, "╭─")} ${senderText}  ${time}  ${status}`,
+        `${neonColor(directionColor, "╰─")} ${neonColor("white", messageLines[0] || "")}`,
+        ...messageLines.slice(1).map((line) => `   ${neonColor("white", line)}`),
       ].join("\n");
       return alignMessageBlock(bubble, message.direction, process.stdout.columns);
     }
-    return `${time} ${color(directionColor, icon)} ${color("brightBlue", chatLabel)}  ${senderLabel}${separator}${messageText}`;
+    return `${time} ${neonColor(directionColor, icon)} ${neonColor("sky", chatLabel)}  ${senderLabel}${separator}${bodyText}`;
   }
 
   async runCommand(input, pendingImages = []) {
@@ -2351,6 +2501,7 @@ class QQlightApp {
       if (lower === "help" || lower === "h" || lower === "?") return this.showHelp();
       if (lower === "status" || lower === "s") return this.showStatus();
       if (lower === "ls") return this.showWhitelist();
+      if (/^sync(?:\s|$)/.test(lower)) return this.runSyncCommand(command);
       if (/^op(?:\s|$)/.test(lower)) {
         const match = command.match(/^op\s+img(?:\s+(\d+))?$/i);
         if (!match) throw new Error("用法：op img [index]");
@@ -2368,7 +2519,7 @@ class QQlightApp {
       if (/^(sp|sg|sc)(?:\s|$)/.test(lower)) return await this.selectChat(command);
       if (lower === "history" || lower.startsWith("history ")) return this.showHistory(command);
       if (/^gls(?:\s|$)/.test(lower)) return await this.showGroupMembers(command);
-      if (/^(fp|fg)(?:\s|$)/.test(lower)) return this.setFilter(command);
+      if (/^(fp|fg)(?:\s|$)/.test(lower)) return await this.setFilter(command);
       if (this.activeChat && !line.startsWith("/")) {
         return await this.sendToActiveChat(line, pendingImages);
       }
@@ -2395,6 +2546,8 @@ class QQlightApp {
       "  sc                           取消隔离，显示白名单消息（select clear）",
       "  （进入会话后直接输入文字即可发送）",
       "  history [数量]                查看当前隔离聊天的历史消息",
+      "  sync                         补同步当前聊天；未选择聊天时同步全部白名单",
+      "  sync all                     补同步全部白名单聊天",
       "  Ctrl+↑ / Ctrl+↓              向上或向下翻阅当前聊天上下文",
       "  [QQ号/昵称]消息               群聊中@指定成员并发送消息",
       "  gls [关键词]                  列出群成员或按昵称模糊搜索",
@@ -2424,6 +2577,24 @@ class QQlightApp {
         ? `私聊 ${this.activeChat.displayName || this.activeChat.targetId}`
         : `群聊 ${this.activeChat.displayName || "（正在获取群名称）"}`;
     this.writeLine(`当前会话：${currentChat}`);
+    if (this.historySync) {
+      const sync = this.historySync.summary();
+      this.writeLine(`历史同步：${sync.running} 个任务，${sync.partial} 个聊天未完成`);
+      this.writeLine(`最近同步成功：${sync.lastSuccessAt ? new Date(sync.lastSuccessAt).toLocaleString("zh-CN", { hour12: false }) : "尚无"}`);
+    }
+  }
+
+  runSyncCommand(command) {
+    if (!/^sync(?:\s+all)?$/i.test(command)) throw new Error("用法：sync 或 sync all");
+    if (!this.historySync?.ready) {
+      this.writeLine(color("yellow", "[同步] 尚未连接并确认登录账号，请连接后重试。"));
+      return;
+    }
+    if (/\s+all$/i.test(command) || !this.activeChat) this.historySync.requestAll();
+    else {
+      this.writeLine(color("dim", "[同步] 正在补同步当前聊天。"));
+      this.historySync.request(this.activeChat, { priority: true });
+    }
   }
 
   showWhitelist() {
@@ -2432,7 +2603,7 @@ class QQlightApp {
     this.writeLine(`群聊：${this.config.groupIds.length ? this.config.groupIds.join(", ") : "空（不接收）"}`);
   }
 
-  setFilter(command) {
+  async setFilter(command) {
     const match = command.match(/^(fp|fg)\s+(.+)$/i);
     if (!match) throw new Error("用法：fp|fg <ID...>，或填 clear 清空白名单");
     const kind = match[1].toLowerCase() === "fp" ? "private" : "group";
@@ -2447,9 +2618,13 @@ class QQlightApp {
     }
     const currentIds = kind === "private" ? this.config.privateIds : this.config.groupIds;
     const ids = clearsWhitelist ? [] : mergeIds(currentIds, additions);
+    const addedChats = ids.filter((id) => !currentIds.includes(id))
+      .map((targetId) => ({ chatType: kind, targetId }));
+    if (this.historySync) await this.historySync.prepareChats(addedChats);
     if (kind === "private") this.config.privateIds = ids;
     else this.config.groupIds = ids;
     saveConfig(this.config);
+    if (this.historySync?.ready) addedChats.forEach((chat) => this.historySync.request(chat));
     const label = kind === "private" ? "私聊" : "群聊";
     this.writeLine(color("green", clearsWhitelist
       ? `${label}白名单已清空。`
@@ -2523,6 +2698,7 @@ class QQlightApp {
       visibleMessages.forEach((message) => this.writeLine(this.renderMessage(message)));
     }
     if (chat.chatType === "private") this.loadPrivateNickname(chat, revision);
+    this.historySync?.request(chat, { fresh: true, priority: true });
   }
 
   async loadPrivateNickname(chat, revision) {
@@ -2647,6 +2823,7 @@ class QQlightApp {
 
   async sendMessage(chatType, targetId, content, displayText = content) {
     if (!content || (typeof content === "string" && !content.trim())) return;
+    await this.accountReady;
     const action = chatType === "private" ? "send_private_msg" : "send_group_msg";
     const params = chatType === "private"
       ? { user_id: Number(targetId), message: content }
@@ -2655,6 +2832,10 @@ class QQlightApp {
     const message = {
       id: `local-${Date.now()}-${crypto.randomUUID()}`,
       time: Date.now(),
+      receivedAt: Date.now(),
+      selfId: this.selfId || "",
+      source: "local",
+      historyOrder: Date.now() * 1000,
       direction: "outgoing",
       deliveryStatus: "success",
       chatType,
@@ -2675,37 +2856,17 @@ class QQlightApp {
     } catch {
       message.id = `failed-${Date.now()}-${crypto.randomUUID()}`;
       message.deliveryStatus = "failed";
-      const storedFailedMessage = await this.saveMessageImages(message);
-      if (this.addToHistory(storedFailedMessage)) {
-        await this.persistMessage(storedFailedMessage);
-        if (messageMatchesChat(storedFailedMessage, this.activeChat)) {
-          this.displayActiveMessage(storedFailedMessage);
-        }
-      }
-      return;
     }
     const responseMessageId = response && response.data && response.data.message_id;
     if (responseMessageId !== undefined && responseMessageId !== null) {
       message.id = String(responseMessageId);
     }
-    const existingMessage = this.getHistoryMessage(message);
-    if (existingMessage) {
-      if (messageMatchesChat(existingMessage, this.activeChat)) {
-        this.displayActiveMessage(existingMessage);
-      }
-      return;
-    }
-    const storedMessage = await this.saveMessageImages(message);
-    if (!this.addToHistory(storedMessage)) return;
-    await this.persistMessage(storedMessage);
-    if (messageMatchesChat(storedMessage, this.activeChat)) {
-      this.displayActiveMessage(storedMessage);
-    } else {
-      this.writeLine(color("green", "发送成功（当前会话已隔离）"));
-    }
+    const task = this.messageQueue.catch(() => {}).then(() => this.receiveMessage(message));
+    this.messageQueue = task.catch(() => {});
+    await task;
   }
 
-  exit() {
+  async exit() {
     if (this.exiting) return;
     this.exiting = true;
     if (this.keypressHandler) process.stdin.off("keypress", this.keypressHandler);
@@ -2718,7 +2879,17 @@ class QQlightApp {
     this.submittedLineBatch = [];
     if (this.bracketedPasteEnabled) this.setBracketedPaste(false);
     this.connection.stop();
+    const syncStopped = this.historySync?.stop();
+    this.imageFetchControllers?.forEach((controller) => controller.abort());
     if (this.rl) this.rl.close();
+    await this.messageQueue.catch(() => {});
+    await this.imageSaveQueue.catch(() => {});
+    await syncStopped;
+    if (this.historyStore) {
+      await this.historyStore.flush().catch((error) => {
+        process.stderr.write(`[错误] 退出时聊天记录保存失败：${error.message}\n`);
+      });
+    }
     process.stdout.write("QQlight 已退出。\n");
   }
 }

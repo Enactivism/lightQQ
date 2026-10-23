@@ -3,5 +3,7 @@
   "accessToken": "",
   "privateIds": [],
   "groupIds": [],
-  "maxHistory": 200
+  "maxHistory": 200,
+  "syncPageSize": 50,
+  "syncConcurrency": 2
 }

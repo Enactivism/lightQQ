@@ -795,7 +795,7 @@ test("文字粘贴读取完成后会替换暂存输入而不是追加一份", ()
   assert.equal(app.pasteSession, null);
 });
 
-test("会话中没有斜杠的命令名称和别名按普通文字发送", async () => {
+test("会话中没有斜杠的命令名称和别名确认后按普通文字发送", async () => {
   const app = Object.create(QQlightApp.prototype);
   app.activeChat = { chatType: "private", targetId: "123456789" };
   const sent = [];
@@ -810,10 +810,73 @@ test("会话中没有斜杠的命令名称和别名按普通文字发送", async
     "history 5", "gls 小明", "fp clear", "fg 987654",
   ];
 
-  for (const message of messages) await app.runCommand(message);
+  for (const message of messages) {
+    const count = sent.length;
+    await app.runCommand(message);
+    assert.equal(sent.length, count);
+    assert.match(output.at(-1), /是否发送此消息.*可能是你想要执行的指令\//);
+    assert.equal(app.pendingMessageConfirmation.text, message);
+    await app.runCommand("y");
+    assert.equal(app.pendingMessageConfirmation, null);
+  }
 
   assert.deepEqual(sent, messages.map((message) => ["private", "123456789", message, message]));
-  assert.deepEqual(output, []);
+  assert.equal(output.length, messages.length);
+});
+
+test("疑似指令取消、空确认和无效回答均不会发送", async () => {
+  const app = new QQlightApp({});
+  app.activeChat = { chatType: "private", targetId: "123456789" };
+  const output = [];
+  app.writeLine = (line) => output.push(line);
+  app.sendToActiveChat = () => assert.fail("不应发送");
+  for (const answer of ["n", "NO", ""]) {
+    await app.runCommand("help");
+    assert.match(app.getPrompt(), /指令\/help.*y\/N/);
+    await app.runCommand("maybe");
+    assert.ok(app.pendingMessageConfirmation);
+    await app.runCommand(answer);
+    assert.equal(app.pendingMessageConfirmation, null);
+  }
+  await app.runCommand("help");
+  app.clearCurrentInput();
+  assert.equal(app.pendingMessageConfirmation, null);
+  await app.runCommand("help");
+  await app.runCommand("/help");
+  assert.equal(app.pendingMessageConfirmation, null);
+  assert.match(output.at(-1), /进入私聊/);
+});
+
+test("确认发送保留图片，且不会误投到变化后的会话", async () => {
+  const app = new QQlightApp({});
+  app.activeChat = { chatType: "group", targetId: "987654" };
+  app.writeLine = () => {};
+  const sent = [];
+  app.sendToActiveChat = async (...args) => sent.push(args);
+  const images = [{ type: "image", data: { file: "base64://aW1n" } }];
+  await app.runCommand("HELP {图片}", images);
+  // An ordinary sentence is sent directly, even if it contains a command word.
+  assert.equal(sent.length, 1);
+  await app.runCommand("sync all {图片}", images);
+  assert.equal(sent.length, 1);
+  await app.runCommand("YES");
+  assert.deepEqual(sent.at(-1), ["sync all {图片}", images]);
+  await app.runCommand("help");
+  app.activeChat = { chatType: "private", targetId: "123456789" };
+  await app.runCommand("y");
+  assert.equal(sent.length, 2);
+  assert.equal(app.pendingMessageConfirmation, null);
+});
+
+test("普通消息及包含指令子串的单词直接发送", async () => {
+  const app = new QQlightApp({});
+  app.activeChat = { chatType: "private", targetId: "123456789" };
+  app.writeLine = () => assert.fail("普通消息不应提醒");
+  const sent = [];
+  app.sendToActiveChat = async (text) => sent.push(text);
+  const messages = ["你好", "helpful", "请查看 help", "historybook", "这是一条普通消息"];
+  for (const message of messages) await app.runCommand(message);
+  assert.deepEqual(sent, messages);
 });
 
 test("斜杠命令打开帮助，未知命令和无会话的文字显示提示", async () => {

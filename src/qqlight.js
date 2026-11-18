@@ -1203,6 +1203,7 @@ class QQlightApp {
     this.configPath = configPath;
     this.config = config ? { ...DEFAULT_CONFIG, ...config } : loadConfig(configPath);
     this.connectionEditor = null;
+    this.pendingMessageConfirmation = null;
     this.readlineOutput = null;
     this.historyByChat = new Map();
     this.groupMembersById = new Map();
@@ -2169,6 +2170,9 @@ class QQlightApp {
   }
 
   getPrompt() {
+    if (this.pendingMessageConfirmation) {
+      return neonColor("yellow", `是否发送此消息，此消息可能是你想要执行的指令${this.pendingMessageConfirmation.suggestion}？[y/N]: `);
+    }
     if (this.connectionEditor) {
       const prompts = {
         url: "[连接配置 1/3] WebSocket 地址（回车保留）: ",
@@ -2292,6 +2296,10 @@ class QQlightApp {
 
   clearCurrentInput() {
     this.pendingImages = [];
+    if (this.pendingMessageConfirmation) {
+      this.pendingMessageConfirmation = null;
+      this.updatePrompt();
+    }
     if (this.connectionEditor) return this.cancelConnectionConfig();
     if (!this.rl || this.exiting) return;
     this.rl.write(null, { ctrl: true, name: "a" });
@@ -2900,17 +2908,56 @@ class QQlightApp {
     return `${time} ${neonColor(directionColor, icon)} ${neonColor("sky", chatLabel)}  ${senderLabel}${separator}${bodyText}`;
   }
 
+  getCommandSuggestion(text) {
+    const command = String(text).trim();
+    if (/^(?:help|h|\?|config|status|s|ls|reconnect|r|quit|exit|q)$/i.test(command)
+      || /^(?:sendfile|send\s+file|sync|op|sp|sg|sc|history|gls|fp|fg)(?:\s|$)/i.test(command)) {
+      return `/${command}`;
+    }
+    return null;
+  }
+
   async runCommand(input, pendingImages = []) {
     const line = decodeInputNewlines(input).trim();
-    if (!line && !this.connectionEditor) {
+    if (!line && !this.connectionEditor && !this.pendingMessageConfirmation) {
       if (this.rl) this.promptInput();
       return;
     }
     this.runningCommand = true;
     try {
+      if (this.pendingMessageConfirmation) {
+        const pending = this.pendingMessageConfirmation;
+        if (/^(?:y|yes)$/i.test(line)) {
+          this.pendingMessageConfirmation = null;
+          this.updatePrompt();
+          if (!this.activeChat || !messageMatchesChat(pending.chat, this.activeChat)) {
+            this.writeLine(color("yellow", "[提示] 当前会话已变化，已取消发送。"));
+            return;
+          }
+          return await this.sendToActiveChat(pending.text, pending.pendingImages);
+        }
+        if (!line || /^(?:n|no)$/i.test(line) || line.startsWith("/")) {
+          this.pendingMessageConfirmation = null;
+          this.updatePrompt();
+          this.writeLine(color("dim", "[提示] 已取消发送。"));
+          if (!line.startsWith("/")) return;
+        } else {
+          this.writeLine(color("yellow", "请输入 y 确认发送，n 或回车取消；也可直接输入 / 指令。"));
+          return;
+        }
+      }
       if (this.connectionEditor) return this.submitConnectionConfig(line);
       if (!line.startsWith("/")) {
-        if (this.activeChat) return await this.sendToActiveChat(line, pendingImages);
+        if (this.activeChat) {
+          const suggestion = this.getCommandSuggestion(line);
+          if (suggestion) {
+            this.pendingMessageConfirmation = { text: line, pendingImages, suggestion, chat: { ...this.activeChat } };
+            this.writeLine(color("yellow", `是否发送此消息，此消息可能是你想要执行的指令${suggestion}？输入 y 发送，n 或回车取消。`));
+            this.updatePrompt();
+            return;
+          }
+          return await this.sendToActiveChat(line, pendingImages);
+        }
         this.writeLine(color("yellow", "请先使用 /sp 或 /sg 进入会话再发送消息。输入 /help 查看命令。"));
         return;
       }

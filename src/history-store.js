@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const readline = require("node:readline");
 const crypto = require("node:crypto");
+const { mergeFiles } = require("./file-transfer");
 
 function chatKey(chat) {
   if (!chat || !["private", "group"].includes(chat.chatType) || !/^\d+$/.test(String(chat.targetId))) {
@@ -47,6 +48,7 @@ function mergeRecord(previous, next) {
   if (!next.imageSources?.length && previous.imageSources?.length && !merged.imagePaths?.length) {
     merged.imageSources = previous.imageSources;
   }
+  merged.files = mergeFiles(previous.files, next.files);
   return merged;
 }
 
@@ -56,8 +58,8 @@ function fingerprint(record) {
 
 // Keep IDs and merge metadata in memory, rather than retaining every message body.
 function metadata(record) {
-  const { time, receivedAt, serverTime, realSeq, historyOrder, selfId, imagePaths, imageState } = record;
-  return { time, receivedAt, serverTime, realSeq, historyOrder, selfId, imagePaths, imageState,
+  const { time, receivedAt, serverTime, realSeq, historyOrder, selfId, imagePaths, imageState, files } = record;
+  return { time, receivedAt, serverTime, realSeq, historyOrder, selfId, imagePaths, imageState, files,
     hash: fingerprint(record) };
 }
 

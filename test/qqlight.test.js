@@ -670,7 +670,7 @@ test("群聊输入 [QQ号]消息 会构造标准 at 消息段", async () => {
     sent = args;
   };
 
-  await app.sendToActiveChat("[123456789]你好");
+  await app.runCommand("[123456789]你好");
 
   assert.deepEqual(sent, [
     "group",
@@ -722,7 +722,7 @@ test("粘贴图片使用花括号占位符且不会被解析成群聊@成员", a
     sent = args;
   };
 
-  await app.sendToActiveChat("{图片}", [{
+  await app.runCommand("{图片}", [{
     type: "image",
     data: { file: "base64://image-data" },
   }]);
@@ -795,6 +795,58 @@ test("文字粘贴读取完成后会替换暂存输入而不是追加一份", ()
   assert.equal(app.pasteSession, null);
 });
 
+test("会话中没有斜杠的命令名称和别名按普通文字发送", async () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.activeChat = { chatType: "private", targetId: "123456789" };
+  const sent = [];
+  const output = [];
+  app.sendMessage = async (...args) => sent.push(args);
+  app.writeLine = (line) => output.push(line);
+  app.exit = () => output.push("退出");
+  const messages = [
+    "help", "h", "?", "config", "status", "s", "ls", "sendfile 报告.pdf",
+    "send file 报告.pdf", "sync all", "op img 2", "reconnect", "r",
+    "quit", "exit", "q", "sp 123456789", "sg 987654", "sc",
+    "history 5", "gls 小明", "fp clear", "fg 987654",
+  ];
+
+  for (const message of messages) await app.runCommand(message);
+
+  assert.deepEqual(sent, messages.map((message) => ["private", "123456789", message, message]));
+  assert.deepEqual(output, []);
+});
+
+test("斜杠命令打开帮助，未知命令和无会话的文字显示提示", async () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.activeChat = { chatType: "group", targetId: "987654" };
+  const output = [];
+  const sent = [];
+  app.writeLine = (line) => output.push(line);
+  app.sendToActiveChat = async (...args) => sent.push(args);
+
+  await app.runCommand("/help");
+  assert.match(output.join("\n"), /\/sc\s+取消隔离/);
+
+  await app.runCommand("/unknown");
+  assert.match(output.at(-1), /未知命令.*\/help/);
+
+  app.activeChat = null;
+  await app.runCommand("help");
+  assert.match(output.at(-1), /\/sp.*\/sg.*进入会话/);
+  assert.deepEqual(sent, []);
+});
+
+test("Tab 只为带斜杠的会话命令补全白名单号码", () => {
+  const app = Object.create(QQlightApp.prototype);
+  app.config = { privateIds: ["123456", "234567"], groupIds: ["987654"] };
+
+  assert.deepEqual(app.completeInput("sp 12"), [[], "sp 12"]);
+  assert.deepEqual(app.completeInput("sg"), [[], "sg"]);
+  assert.deepEqual(app.completeInput("/sp"), [["/sp "], "/sp"]);
+  assert.deepEqual(app.completeInput("/sp 12"), [["/sp 123456"], "/sp 12"]);
+  assert.deepEqual(app.completeInput("/sg 9"), [["/sg 987654"], "/sg 9"]);
+});
+
 test("按下回车提交时才恢复粘贴文本中的换行", async () => {
   const app = Object.create(QQlightApp.prototype);
   app.activeChat = { chatType: "private", targetId: "123456789" };
@@ -829,7 +881,7 @@ test("同一批次的多行输入只提交一次", async () => {
   assert.deepEqual(sent, [["第一行\n第二行", []]]);
 });
 
-test("gls 可以列出或模糊搜索群成员", async () => {
+test("/gls 可以按名称模糊搜索群成员", async () => {
   const app = Object.create(QQlightApp.prototype);
   app.activeChat = { chatType: "group", targetId: "987654" };
   app.groupMembersById = new Map([[
@@ -843,7 +895,7 @@ test("gls 可以列出或模糊搜索群成员", async () => {
   const output = [];
   app.writeLine = (line) => output.push(line);
 
-  await app.showGroupMembers("gls 叉");
+  await app.runCommand("/gls 叉");
 
   assert.match(output[0], /匹配“叉”的群成员（2）：/);
   assert.match(output[1], /叉叉\.L.*123456789/);

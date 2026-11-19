@@ -14,6 +14,7 @@ const WebSocket = require("ws");
 const { HistoryStore, compareMessages, mergeRecord } = require("./history-store");
 const { HistorySync, SYNC_DEFAULTS } = require("./history-sync");
 const { validateConnectionSettings, createConfigReadlineOutput } = require("./connection-config");
+const { TerminalMouseInput } = require("./terminal-mouse-input");
 const {
   FileTransfer, DEFAULT_MAX_FILE_SIZE_MB, fileError, formatFileError,
   normalizeFileSource, fileReference, formatFileLabel, resolveSendFilePath,
@@ -1225,6 +1226,7 @@ class QQlightApp {
     this.submittedLineFlushTimer = null;
     this.keypressHandler = null;
     this.inputDataHandler = null;
+    this.mouseInput = null;
     this.sigintHandler = null;
     this.projectDir = path.resolve(__dirname, "..");
     this.historyDir = HISTORY_DIR;
@@ -1274,17 +1276,24 @@ class QQlightApp {
 
   start() {
     this.printBanner();
+    const terminal = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (terminal && process.env.TERM !== "dumb") {
+      this.mouseInput = new TerminalMouseInput(
+        process.stdin, process.stdout, (direction) => this.scrollChatContext(direction),
+      );
+    }
+    const input = this.mouseInput || process.stdin;
     this.inputDataHandler = (chunk) => this.observeInputData(chunk);
-    process.stdin.on("data", this.inputDataHandler);
+    input.on("data", this.inputDataHandler);
     this.readlineOutput = createConfigReadlineOutput(process.stdout, () => this.connectionEditor?.step === "token");
     this.rl = readline.createInterface({
-      input: process.stdin,
+      input,
       output: this.readlineOutput,
-      terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+      terminal,
       prompt: this.getPrompt(),
       completer: (line) => this.completeInput(line),
     });
-    readline.emitKeypressEvents(process.stdin, this.rl);
+    readline.emitKeypressEvents(input, this.rl);
     this.keypressHandler = (sequence, key) => {
       if (key?.name === "paste-start" || key?.sequence === BRACKETED_PASTE_START) {
         this.beginPasteSession("bracketed");
@@ -1321,7 +1330,7 @@ class QQlightApp {
       if (key.shift) this.handleTextPaste();
       else this.handleImagePaste();
     };
-    process.stdin.on("keypress", this.keypressHandler);
+    input.on("keypress", this.keypressHandler);
     this.rl.on("line", (line) => {
       if (this.pasteSession) {
         this.pasteSession.lines.push(String(line));
@@ -1343,6 +1352,7 @@ class QQlightApp {
     this.rl.on("SIGINT", () => this.clearCurrentInput());
     this.sigintHandler = () => this.clearCurrentInput();
     process.on("SIGINT", this.sigintHandler);
+    if (this.mouseInput) process.stdin.pipe(this.mouseInput);
     this.setBracketedPaste(true);
     this.rl.prompt();
     this.initializeHistorySync()
@@ -2199,6 +2209,7 @@ class QQlightApp {
 
   updatePrompt() {
     if (!this.rl) return;
+    this.mouseInput?.setTracking(Boolean(this.activeChat && !this.connectionEditor));
     this.rl.setPrompt(this.getPrompt());
     if (!this.runningCommand && !this.exiting) this.promptInput(true);
   }
@@ -3016,7 +3027,7 @@ class QQlightApp {
       "  /history [数量]              查看当前隔离聊天的历史消息",
       "  /sync                        补同步当前聊天，未选择聊天时同步全部白名单",
       "  /sync all                    补同步全部白名单聊天",
-      "  Ctrl+↑ / Ctrl+↓              向上或向下翻阅当前聊天上下文",
+      "  鼠标滚轮 / Ctrl+↑ / Ctrl+↓   向上或向下翻阅当前聊天上下文",
       "  [QQ号/昵称]消息               群聊中@指定成员并发送消息",
       "  /gls [关键词]                列出群成员或按昵称模糊搜索",
       "  /op img [index]              打开图片，省略 index 时打开最近一张",
@@ -3389,8 +3400,9 @@ class QQlightApp {
   async exit() {
     if (this.exiting) return;
     this.exiting = true;
-    if (this.keypressHandler) process.stdin.off("keypress", this.keypressHandler);
-    if (this.inputDataHandler) process.stdin.off("data", this.inputDataHandler);
+    const input = this.mouseInput || process.stdin;
+    if (this.keypressHandler) input.off("keypress", this.keypressHandler);
+    if (this.inputDataHandler) input.off("data", this.inputDataHandler);
     if (this.sigintHandler) process.off("SIGINT", this.sigintHandler);
     if (this.pasteSessionFinishTimer) clearTimeout(this.pasteSessionFinishTimer);
     this.pasteSessionFinishTimer = null;
@@ -3403,6 +3415,10 @@ class QQlightApp {
     this.imageFetchControllers?.forEach((controller) => controller.abort());
     this.fileTransferControllers.forEach((controller) => controller.abort());
     if (this.rl) this.rl.close();
+    if (this.mouseInput) {
+      process.stdin.unpipe(this.mouseInput);
+      this.mouseInput.destroy();
+    }
     this.readlineOutput?.destroy();
     await this.messageQueue.catch(() => {});
     await this.imageSaveQueue.catch(() => {});
